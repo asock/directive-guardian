@@ -31,6 +31,19 @@ assert_contains() {
     fi
 }
 
+# Exact-line match — substring assertions miss bugs like a counter splitting
+# `0\n0` across two lines (B1/B4 regression).
+assert_line() {
+    local output="$1" expected="$2" label="$3"
+    if echo "$output" | grep -qxF "$expected"; then
+        pass "$label"
+    else
+        fail "$label — expected exact line: $expected"
+        echo "    GOT:" >&2
+        echo "$output" | sed 's/^/      /' >&2
+    fi
+}
+
 assert_not_contains() {
     local output="$1" unexpected="$2" label="$3"
     if echo "$output" | grep -qF "$unexpected"; then
@@ -253,3 +266,23 @@ output=$("$CTL" status 2>&1)
 assert_contains "$output" "Directives:" "T15.1: Shows directive count"
 assert_contains "$output" "Integrity:" "T15.2: Shows integrity status"
 assert_contains "$output" "GUARDIAN BOOT" "T15.3: Shows recent log entries"
+# B1/B4 regression: counter line must be on a single line, not split because
+# `grep -c ... || echo 0` captured "0\n0" when a count was zero.
+assert_line "$output" "  Directives: 3 total (3 enabled, 0 disabled)" \
+    "T15.4: Status counter line is single-line and well-formed"
+
+# ── T16: Multi-word category survives list (B2 regression) ────────────
+echo ""
+echo "── T16: Multi-word category in list ──"
+
+"$CTL" add "Spaced" medium "tool config" "use sane defaults" >/dev/null
+output=$("$CTL" list 2>&1)
+assert_contains "$output" "cat=tool config" "T16.1: Multi-word category not collapsed"
+"$CTL" remove DIRECTIVE-004 >/dev/null
+
+# ── T17: --enabled validation (S5) ────────────────────────────────────
+echo ""
+echo "── T17: --enabled value validation ──"
+
+assert_exit_code 1 "T17.1: Bogus --enabled value rejected" \
+    "$CTL" edit DIRECTIVE-001 --enabled maybe

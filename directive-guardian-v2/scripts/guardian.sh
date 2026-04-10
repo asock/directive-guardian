@@ -19,6 +19,7 @@ REGISTRY="$MEMORY_DIR/directives.md"
 CHECKSUM_FILE="$MEMORY_DIR/directives.sha256"
 LOGFILE="$MEMORY_DIR/directive-guardian.log"
 LOCKFILE="$MEMORY_DIR/.guardian.lock"
+# Captured once for the manifest output; log() refreshes per-line (S7).
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 MAX_LOG_LINES=500
 DRY_RUN="${GUARDIAN_DRY_RUN:-false}"
@@ -26,7 +27,13 @@ DRY_RUN="${GUARDIAN_DRY_RUN:-false}"
 # ── Helpers ───────────────────────────────────────────────────────────
 
 log() {
-    echo "[$TIMESTAMP] $1" >> "$LOGFILE"
+    echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $1" >> "$LOGFILE"
+}
+
+# Minimal JSON string escape for shell-supplied values (S4 — paths can contain
+# backslashes or quotes, especially on Windows/WSL).
+json_escape_shell() {
+    printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
 }
 
 rotate_log() {
@@ -44,6 +51,8 @@ rotate_log() {
 
 emit_empty_manifest() {
     local status="${1:-empty}"
+    local registry_esc
+    registry_esc=$(json_escape_shell "$REGISTRY")
     cat << MANIFEST
 {
   "directives": [],
@@ -53,7 +62,7 @@ emit_empty_manifest() {
   "status": "$status",
   "integrity": "unknown",
   "timestamp": "$TIMESTAMP",
-  "registry": "$REGISTRY"
+  "registry": "$registry_esc"
 }
 MANIFEST
 }
@@ -229,7 +238,9 @@ END {
 # ── Count & Sort ──────────────────────────────────────────────────────
 # Count total, enabled, disabled using awk on the JSON (portable)
 
-total_count=$(echo "$parse_output" | awk -F'"id"' '{print NF-1}')
+# S3: count by the full key+value prefix instead of bare `"id"`, which would
+# false-match a directive whose escaped text happened to contain the substring.
+total_count=$(echo "$parse_output" | { grep -o '"id":"DIRECTIVE-' || true; } | wc -l | tr -d ' ')
 enabled_count=$(echo "$parse_output" | { grep -o '"enabled":true' || true; } | wc -l | tr -d ' ')
 disabled_count=$(echo "$parse_output" | { grep -o '"enabled":false' || true; } | wc -l | tr -d ' ')
 
@@ -273,6 +284,7 @@ log "GUARDIAN BOOT COMPLETE — integrity=$integrity, $enabled_count/$total_coun
 
 # ── Output Manifest ───────────────────────────────────────────────────
 
+REGISTRY_ESC=$(json_escape_shell "$REGISTRY")
 cat << MANIFEST
 {
   "directives": $sorted_output,
@@ -282,7 +294,7 @@ cat << MANIFEST
   "status": "ready",
   "integrity": "$integrity",
   "timestamp": "$TIMESTAMP",
-  "registry": "$REGISTRY"
+  "registry": "$REGISTRY_ESC"
 }
 MANIFEST
 

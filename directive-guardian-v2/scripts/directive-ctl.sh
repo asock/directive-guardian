@@ -21,11 +21,11 @@ REGISTRY="$MEMORY_DIR/directives.md"
 LOGFILE="$MEMORY_DIR/directive-guardian.log"
 LOCKFILE="$MEMORY_DIR/.guardian.lock"
 CHECKSUM_FILE="$MEMORY_DIR/directives.sha256"
-TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
-log() { echo "[$TIMESTAMP] $1" >> "$LOGFILE"; }
+# Each log line gets a fresh timestamp so long-running invocations stay accurate (S7).
+log() { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $1" >> "$LOGFILE"; }
 
 die() { echo "✗ $1" >&2; exit 1; }
 
@@ -50,10 +50,15 @@ acquire_lock() {
     fi
 }
 
-# Backup before destructive ops (SEC-002, FEAT-002)
+# Backup before destructive ops (SEC-002, FEAT-002).
+# Writes both a rolling .bak (latest, easy to find) AND a timestamped copy
+# so two destructive ops in a row don't destroy the only recoverable state (S2).
 backup_registry() {
+    local ts
+    ts=$(date -u +"%Y%m%dT%H%M%SZ")
     cp "$REGISTRY" "$REGISTRY.bak"
-    log "BACKUP — created $REGISTRY.bak"
+    cp "$REGISTRY" "$MEMORY_DIR/directives.$ts.md.bak"
+    log "BACKUP — created $REGISTRY.bak and directives.$ts.md.bak"
 }
 
 # Update checksum after modifications
@@ -70,6 +75,15 @@ validate_priority() {
     case "$1" in
         critical|high|medium|low) return 0 ;;
         *) die "Invalid priority '$1' — must be: critical, high, medium, low" ;;
+    esac
+}
+
+# Validate enabled flag (S5 — guardian normalizes anything-not-false to true,
+# which silently masks typos like `--enabled maybe`).
+validate_enabled() {
+    case "$1" in
+        true|false) return 0 ;;
+        *) die "Invalid enabled value '$1' — must be: true or false" ;;
     esac
 }
 
@@ -175,6 +189,12 @@ cmd_edit() {
     fi
 
     shift
+
+    # S6: hoist lock+backup above the loop so multi-field edits take ONE lock,
+    # ONE backup, and don't lose the original `.bak` between fields.
+    acquire_lock
+    backup_registry
+
     local field="" value=""
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -182,12 +202,9 @@ cmd_edit() {
             --priority)   field="priority";  value="${2:?Missing value}"; shift 2; validate_priority "$value" ;;
             --category)   field="category";  value="${2:?Missing value}"; shift 2 ;;
             --verify)     field="verify";    value="${2:?Missing value}"; shift 2 ;;
-            --enabled)    field="enabled";   value="${2:?Missing value}"; shift 2 ;;
+            --enabled)    field="enabled";   value="${2:?Missing value}"; shift 2; validate_enabled "$value" ;;
             *) die "Unknown flag: $1 (use --directive, --priority, --category, --verify, --enabled)" ;;
         esac
-
-        acquire_lock
-        backup_registry
 
         # Use awk to find the target block and replace the specific field
         awk -v target="$target" -v field="$field" -v value="$value" '
@@ -264,9 +281,11 @@ cmd_list() {
         title = $0; sub(/^## \[DIRECTIVE-[0-9]+\] */, "", title)
         priority = ""; category = ""; enabled = "true"
     }
-    /^- \*\*priority\*\*:/ { val=$0; sub(/.*: */, "", val); gsub(/ /, "", val); priority=val }
-    /^- \*\*category\*\*:/ { val=$0; sub(/.*: */, "", val); gsub(/ /, "", val); category=val }
-    /^- \*\*enabled\*\*:/ { val=$0; sub(/.*: */, "", val); gsub(/ /, "", val); enabled=val }
+    # B2: anchor the field-name match and trim only leading/trailing whitespace
+    # so multi-word categories survive (was: gsub(/ /, "") which collapsed them).
+    /^- \*\*priority\*\*:/ { val=$0; sub(/^- \*\*priority\*\*: */, "", val); gsub(/^ +| +$/, "", val); priority=val }
+    /^- \*\*category\*\*:/ { val=$0; sub(/^- \*\*category\*\*: */, "", val); gsub(/^ +| +$/, "", val); category=val }
+    /^- \*\*enabled\*\*:/  { val=$0; sub(/^- \*\*enabled\*\*: */,  "", val); gsub(/^ +| +$/, "", val); enabled=val }
     END {
         if (id != "") {
             show = 1
@@ -321,12 +340,13 @@ cmd_status() {
 
     echo "═══ Guardian Status ═══"
 
-    # Directive count
-    local total
-    total=$(grep -cE '^## \[DIRECTIVE-' "$REGISTRY" 2>/dev/null || echo 0)
-    local enabled disabled
-    enabled=$(grep -cE '^\- \*\*enabled\*\*: *true' "$REGISTRY" 2>/dev/null || echo 0)
-    disabled=$(grep -cE '^\- \*\*enabled\*\*: *false' "$REGISTRY" 2>/dev/null || echo 0)
+    # B1/B4: count via awk so a zero count is a single "0", not the
+    # double-output `grep -c ... || echo 0` produced (grep prints "0" AND exits 1,
+    # so the fallback ran and the substitution captured "0\n0").
+    local total enabled disabled
+    total=$(awk '/^## \[DIRECTIVE-[0-9]+\]/ {n++} END {print n+0}' "$REGISTRY")
+    enabled=$(awk '/^- \*\*enabled\*\*: *true/  {n++} END {print n+0}' "$REGISTRY")
+    disabled=$(awk '/^- \*\*enabled\*\*: *false/ {n++} END {print n+0}' "$REGISTRY")
     echo "  Directives: $total total ($enabled enabled, $disabled disabled)"
 
     # Integrity
@@ -421,10 +441,12 @@ cmd_import() {
         die "jq is required for import — install with: apt install jq / brew install jq"
     fi
 
-    # Parse JSON and append each directive to registry
+    # Parse JSON and append each directive to registry.
+    # S1: process substitution instead of pipe so the loop runs in the parent
+    # shell — otherwise `imported` increments are lost in a subshell.
     local imported=0
-    jq -c '.directives[]' "$infile" 2>/dev/null | while IFS= read -r obj; do
-        local d_id d_title d_pri d_cat d_en d_dir d_ver
+    while IFS= read -r obj; do
+        local d_title d_pri d_cat d_en d_dir d_ver
         d_title=$(echo "$obj" | jq -r '.title')
         d_pri=$(echo "$obj" | jq -r '.priority')
         d_cat=$(echo "$obj" | jq -r '.category')
@@ -445,11 +467,11 @@ cmd_import() {
             [ -n "$d_ver" ] && [ "$d_ver" != "null" ] && echo "- **verify**: ${d_ver}"
         } >> "$REGISTRY"
         imported=$((imported + 1))
-    done
+    done < <(jq -c '.directives[]' "$infile" 2>/dev/null)
 
     update_checksum
-    log "IMPORTED — from $infile"
-    echo "✓ Imported directives from $infile"
+    log "IMPORTED — $imported directives from $infile"
+    echo "✓ Imported $imported directives from $infile"
 }
 
 cmd_checksum() {
@@ -478,10 +500,12 @@ cmd_validate() {
         id = substr($0, RSTART+1, RLENGTH-2)
         priority = ""; category = ""; directive = ""; enabled = ""
     }
-    /^- \*\*priority\*\*:/ { val=$0; sub(/.*: */, "", val); gsub(/ /, "", val); priority=val }
-    /^- \*\*category\*\*:/ { val=$0; sub(/.*: */, "", val); gsub(/ /, "", val); category=val }
-    /^- \*\*directive\*\*:/ { val=$0; sub(/.*: */, "", val); directive=val }
-    /^- \*\*enabled\*\*:/ { val=$0; sub(/.*: */, "", val); gsub(/ /, "", val); enabled=val }
+    # B3: anchor field-name regex; greedy `.*: *` would mangle directive text
+    # containing `: ` (e.g. "use rg: ripgrep is fast").
+    /^- \*\*priority\*\*:/  { val=$0; sub(/^- \*\*priority\*\*: */,  "", val); gsub(/^ +| +$/, "", val); priority=val }
+    /^- \*\*category\*\*:/  { val=$0; sub(/^- \*\*category\*\*: */,  "", val); gsub(/^ +| +$/, "", val); category=val }
+    /^- \*\*directive\*\*:/ { val=$0; sub(/^- \*\*directive\*\*: */, "", val); directive=val }
+    /^- \*\*enabled\*\*:/   { val=$0; sub(/^- \*\*enabled\*\*: */,   "", val); gsub(/^ +| +$/, "", val); enabled=val }
     END {
         if (id != "") {
             if (priority == "") { printf "  ⚠ [%s] missing priority\n", id; errors++ }
