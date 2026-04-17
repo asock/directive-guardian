@@ -2,6 +2,23 @@
 
 All notable changes to directive-guardian.
 
+## [1.0.0] — 2026-04-17
+
+First public release. Consolidates the internal 2.0 → 2.3 development
+line into a single shipped version. Everything in 2.0–2.3 below is
+part of 1.0; the sub-sections are kept for provenance.
+
+- Claude Code plugin (SessionStart hook + 10 slash commands + installer)
+- Real integrity guard (no self-heal; `acknowledge` workflow)
+- Full CRUD / audit / show / validate / duplicate-ID detection
+- Multiline directives (parser) and onboarding from existing CLAUDE.md
+- Git mode: auto-commit mutations, multi-device sync via `sync`
+- Auto-pruned backups, schema versioning, `--json` output,
+  category-grouped markdown brief
+- Race-safe under concurrent writes (caught and fixed the
+  `DIRECTIVE-008/009` octal bug via a 10-way parallel-add stress test)
+- 130 tests green
+
 ## [2.3.0] — 2026-04-17
 
 ### Added
