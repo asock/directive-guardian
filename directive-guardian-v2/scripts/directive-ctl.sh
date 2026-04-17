@@ -16,16 +16,43 @@
 
 set -euo pipefail
 
-MEMORY_DIR="${OPENCLAW_MEMORY_DIR:-$HOME/.openclaw/memory}"
+# Keep env-var resolution identical to guardian.sh so the two never disagree.
+resolve_memory_dir() {
+    if [ -n "${DIRECTIVE_MEMORY_DIR:-}" ]; then echo "$DIRECTIVE_MEMORY_DIR"; return; fi
+    if [ -n "${CLAUDE_MEMORY_DIR:-}"    ]; then echo "$CLAUDE_MEMORY_DIR";    return; fi
+    if [ -n "${OPENCLAW_MEMORY_DIR:-}"  ]; then echo "$OPENCLAW_MEMORY_DIR";  return; fi
+    if [ -d "$HOME/.openclaw/memory" ] && [ ! -d "$HOME/.claude/directive-guardian" ]; then
+        echo "$HOME/.openclaw/memory"; return
+    fi
+    echo "$HOME/.claude/directive-guardian"
+}
+
+MEMORY_DIR=$(resolve_memory_dir)
 REGISTRY="$MEMORY_DIR/directives.md"
 LOGFILE="$MEMORY_DIR/directive-guardian.log"
 LOCKFILE="$MEMORY_DIR/.guardian.lock"
 CHECKSUM_FILE="$MEMORY_DIR/directives.sha256"
+ACK_FILE="$MEMORY_DIR/.integrity-ack"
+MAX_LOG_LINES=500
+MAX_BACKUPS=10  # directives.<ts>.md.bak files to retain after prune
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
 # Each log line gets a fresh timestamp so long-running invocations stay accurate (S7).
 log() { echo "[$(date -u +"%Y-%m-%dT%H:%M:%SZ")] $1" >> "$LOGFILE"; }
+
+# Rotate the log from the CLI path too — previously only guardian.sh did this,
+# so heavy CLI use (AUDIT-07) could blow past the cap between boots.
+rotate_log() {
+    [ -f "$LOGFILE" ] || return 0
+    local line_count keep
+    line_count=$(wc -l < "$LOGFILE" 2>/dev/null || echo 0)
+    if [ "$line_count" -gt "$MAX_LOG_LINES" ]; then
+        keep=$(( MAX_LOG_LINES / 2 ))
+        tail -n "$keep" "$LOGFILE" > "$LOGFILE.tmp" && mv "$LOGFILE.tmp" "$LOGFILE"
+        log "LOG_ROTATED — trimmed from $line_count to $keep lines"
+    fi
+}
 
 die() { echo "✗ $1" >&2; exit 1; }
 
@@ -141,6 +168,7 @@ cmd_add() {
     } >> "$REGISTRY"
 
     update_checksum
+    rotate_log
     log "ADDED [DIRECTIVE-${nid}] \"${title}\" (priority=$priority, category=$category)"
     echo "✓ Added DIRECTIVE-${nid}: ${title}"
 }
@@ -157,24 +185,40 @@ cmd_remove() {
     acquire_lock
     backup_registry
 
-    # Use awk for safe block removal — handles last-directive-in-file correctly
+    # AUDIT-03: skip the ENTIRE block (heading + any content) until the next
+    # `## [DIRECTIVE-` heading or EOF. The previous version only skipped field
+    # lines and bailed on the first blank, leaking any stray content between
+    # the last field and the next directive.
     awk -v target="$target" '
-    BEGIN { skip = 0 }
+    BEGIN { skip = 0; pending_blank = 0 }
     /^## \[DIRECTIVE-[0-9]+\]/ {
+        if (skip) {
+            # We were inside the removed block — eat the trailing blank we
+            # held back so the output does not accumulate empty separators.
+            pending_blank = 0
+        }
         if (index($0, "[" target "]") > 0) {
             skip = 1
             next
-        } else {
-            skip = 0
         }
+        skip = 0
+        if (pending_blank) { print ""; pending_blank = 0 }
+        print
+        next
     }
-    skip && /^- \*\*/ { next }
-    skip && /^$/ { skip = 0; next }
-    { print }
+    skip { next }
+    /^$/ {
+        # Defer blanks so we can drop the one immediately following a removed block.
+        pending_blank = 1
+        next
+    }
+    { if (pending_blank) { print ""; pending_blank = 0 } ; print }
+    END { if (pending_blank && !skip) print "" }
     ' "$REGISTRY" > "$REGISTRY.tmp"
 
     mv "$REGISTRY.tmp" "$REGISTRY"
     update_checksum
+    rotate_log
     log "REMOVED [$target]"
     echo "✓ Removed $target (backup at $REGISTRY.bak)"
 }
@@ -238,6 +282,7 @@ cmd_edit() {
         log "EDITED [$target] set $field=\"$value\""
         echo "✓ Updated $target: $field = $value"
     done
+    rotate_log
 }
 
 cmd_enable() {
@@ -444,7 +489,23 @@ cmd_import() {
     # Parse JSON and append each directive to registry.
     # S1: process substitution instead of pipe so the loop runs in the parent
     # shell — otherwise `imported` increments are lost in a subshell.
-    local imported=0
+    # AUDIT-05: compute next_id ONCE, then increment in-memory. Previously
+    # next_id re-scanned the registry per imported record (O(N²)).
+    local imported=0 skipped=0 conflict_mode="${2:-append}"
+    case "$conflict_mode" in append|skip|replace) ;; *) die "Unknown conflict mode: $conflict_mode (use append|skip|replace)" ;; esac
+
+    local next_num
+    next_num=$(grep -oE 'DIRECTIVE-[0-9]+' "$REGISTRY" 2>/dev/null | \
+               grep -oE '[0-9]+' | sort -n | tail -1)
+    next_num=${next_num:-0}
+
+    local existing_titles=""
+    existing_titles=$(awk '
+        /^## \[DIRECTIVE-[0-9]+\]/ {
+            t = $0; sub(/^## \[DIRECTIVE-[0-9]+\] */, "", t)
+            print t
+        }' "$REGISTRY")
+
     while IFS= read -r obj; do
         local d_title d_pri d_cat d_en d_dir d_ver
         d_title=$(echo "$obj" | jq -r '.title')
@@ -454,8 +515,20 @@ cmd_import() {
         d_dir=$(echo "$obj" | jq -r '.directive')
         d_ver=$(echo "$obj" | jq -r '.verify // ""')
 
+        # Conflict handling (AUDIT-09): dedupe by title, not ID, since ID is
+        # per-registry. `replace` not yet implemented — falls through to append
+        # with a log warning so the semantics are explicit.
+        if echo "$existing_titles" | grep -qxF "$d_title"; then
+            if [ "$conflict_mode" = "skip" ]; then
+                skipped=$((skipped + 1))
+                log "IMPORT_SKIP — title exists: $d_title"
+                continue
+            fi
+        fi
+
+        next_num=$((next_num + 1))
         local nid
-        nid=$(next_id)
+        nid=$(printf "%03d" "$next_num")
 
         {
             echo ""
@@ -466,12 +539,14 @@ cmd_import() {
             echo "- **directive**: ${d_dir}"
             [ -n "$d_ver" ] && [ "$d_ver" != "null" ] && echo "- **verify**: ${d_ver}"
         } >> "$REGISTRY"
+        existing_titles="$existing_titles"$'\n'"$d_title"
         imported=$((imported + 1))
     done < <(jq -c '.directives[]' "$infile" 2>/dev/null)
 
     update_checksum
-    log "IMPORTED — $imported directives from $infile"
-    echo "✓ Imported $imported directives from $infile"
+    rotate_log
+    log "IMPORTED — $imported directives from $infile (mode=$conflict_mode, skipped=$skipped)"
+    echo "✓ Imported $imported directives from $infile (skipped $skipped duplicates)"
 }
 
 cmd_checksum() {
@@ -484,7 +559,19 @@ cmd_validate() {
     ensure_registry
     echo "═══ Validation Report ═══"
 
-    local errors=0
+    # AUDIT-02: detect duplicate IDs. Hand-edits or merge conflicts can create
+    # two `[DIRECTIVE-001]` blocks; edit/remove silently operate on the first.
+    # The awk below prints every ID that appears more than once.
+    awk '
+    /^## \[DIRECTIVE-[0-9]+\]/ {
+        match($0, /\[DIRECTIVE-[0-9]+\]/)
+        id = substr($0, RSTART+1, RLENGTH-2)
+        count[id]++
+    }
+    END {
+        for (id in count) if (count[id] > 1) printf "  ✗ duplicate ID [%s] appears %d times\n", id, count[id]
+    }' "$REGISTRY"
+
     awk '
     /^## \[DIRECTIVE-[0-9]+\]/ {
         if (id != "") {
@@ -522,26 +609,139 @@ cmd_validate() {
     echo "═══════════════════════════"
 }
 
+cmd_show() {
+    local target="${1:?Usage: directive-ctl show DIRECTIVE-XXX}"
+    validate_id "$target"
+    ensure_registry
+    id_exists "$target" || die "$target not found in registry"
+
+    # Print just the target's block (heading through last field). Reuses the
+    # same state machine as remove but inverted — keep inside, drop outside.
+    awk -v target="$target" '
+    /^## \[DIRECTIVE-[0-9]+\]/ {
+        in_block = (index($0, "[" target "]") > 0) ? 1 : 0
+        if (in_block) { print; next }
+    }
+    in_block { print }
+    ' "$REGISTRY"
+}
+
+cmd_acknowledge() {
+    # AUDIT-01: user-explicit consent to re-trust the registry after tamper.
+    # Next guardian.sh run will clear the flag and refresh the checksum.
+    ensure_registry
+    mkdir -p "$MEMORY_DIR"
+    touch "$ACK_FILE"
+    log "INTEGRITY_ACK_QUEUED — user acknowledged tamper; next boot will refresh checksum"
+    echo "✓ Integrity acknowledgement queued — next guardian.sh run will accept current state"
+}
+
+cmd_prune_backups() {
+    ensure_registry
+    local keep="${1:-$MAX_BACKUPS}"
+    case "$keep" in ''|*[!0-9]*) die "prune-backups: keep count must be a non-negative integer" ;; esac
+
+    # List timestamped backups oldest-first so we can drop the head.
+    local -a backups=()
+    while IFS= read -r -d '' f; do
+        backups+=("$f")
+    done < <(find "$MEMORY_DIR" -maxdepth 1 -type f \
+             \( -name 'directives.*.md.bak' -o -name 'directives.*.bak' \) \
+             -print0 2>/dev/null | sort -z)
+
+    local total=${#backups[@]}
+    if [ "$total" -le "$keep" ]; then
+        echo "✓ $total backup(s) present — nothing to prune (keep=$keep)"
+        return 0
+    fi
+    local drop=$((total - keep))
+    local i=0
+    while [ "$i" -lt "$drop" ]; do
+        rm -f -- "${backups[$i]}"
+        i=$((i + 1))
+    done
+    log "PRUNE_BACKUPS — removed $drop backup(s), kept $keep"
+    echo "✓ Pruned $drop old backup(s), kept $keep newest"
+}
+
+cmd_audit() {
+    # One-shot health check used both interactively and by the SessionStart hook.
+    ensure_registry
+    echo "═══ Directive Guardian Audit ═══"
+
+    echo "── Validation ──"
+    cmd_validate | sed 's/^/  /'
+
+    echo "── Duplicates ──"
+    local dup
+    dup=$(awk '/^## \[DIRECTIVE-[0-9]+\]/ { match($0,/\[DIRECTIVE-[0-9]+\]/); id=substr($0,RSTART+1,RLENGTH-2); c[id]++ }
+               END { for (k in c) if (c[k] > 1) print "  ✗ " k " x" c[k] }' "$REGISTRY")
+    if [ -z "$dup" ]; then echo "  ✓ no duplicate IDs"; else echo "$dup"; fi
+
+    echo "── Integrity ──"
+    if [ -f "$CHECKSUM_FILE" ]; then
+        local stored current
+        stored=$(awk '{print $1}' "$CHECKSUM_FILE")
+        if command -v sha256sum >/dev/null 2>&1; then
+            current=$(sha256sum "$REGISTRY" | awk '{print $1}')
+        elif command -v shasum >/dev/null 2>&1; then
+            current=$(shasum -a 256 "$REGISTRY" | awk '{print $1}')
+        else current="unavailable"; fi
+        if [ "$current" = "unavailable" ]; then
+            echo "  ? no hash tool available"
+        elif [ "$stored" = "$current" ]; then
+            echo "  ✓ registry matches stored checksum"
+        else
+            echo "  ✗ MISMATCH — run 'directive-ctl acknowledge' to trust new state"
+        fi
+    else
+        echo "  — no checksum file yet (run guardian.sh)"
+    fi
+
+    echo "── Backups ──"
+    local bcount
+    bcount=$(find "$MEMORY_DIR" -maxdepth 1 -type f \
+             \( -name 'directives.*.md.bak' -o -name 'directives.*.bak' \) 2>/dev/null | wc -l | tr -d ' ')
+    echo "  $bcount timestamped backup(s) retained (cap: $MAX_BACKUPS — run 'prune-backups' to trim)"
+
+    echo "── Last mutation ──"
+    if [ -f "$REGISTRY" ]; then
+        local mtime
+        if stat -c %y "$REGISTRY" >/dev/null 2>&1; then
+            mtime=$(stat -c %y "$REGISTRY")
+        else
+            mtime=$(stat -f %Sm "$REGISTRY" 2>/dev/null || echo unknown)
+        fi
+        echo "  registry modified: $mtime"
+    fi
+
+    echo "═══════════════════════════"
+}
+
 # ── Main Router ───────────────────────────────────────────────────────
 
 cmd="${1:-help}"
 shift 2>/dev/null || true
 
 case "$cmd" in
-    add)        cmd_add "$@" ;;
-    remove)     cmd_remove "$@" ;;
-    edit)       cmd_edit "$@" ;;
-    enable)     cmd_enable "$@" ;;
-    disable)    cmd_disable "$@" ;;
-    list)       cmd_list "$@" ;;
-    search)     cmd_search "$@" ;;
-    status)     cmd_status ;;
-    backup)     cmd_backup ;;
-    restore)    cmd_restore "$@" ;;
-    export)     cmd_export "$@" ;;
-    import)     cmd_import "$@" ;;
-    checksum)   cmd_checksum ;;
-    validate)   cmd_validate ;;
+    add)            cmd_add "$@" ;;
+    remove)         cmd_remove "$@" ;;
+    edit)           cmd_edit "$@" ;;
+    enable)         cmd_enable "$@" ;;
+    disable)        cmd_disable "$@" ;;
+    list)           cmd_list "$@" ;;
+    search)         cmd_search "$@" ;;
+    show|get)       cmd_show "$@" ;;
+    status)         cmd_status ;;
+    audit)          cmd_audit ;;
+    backup)         cmd_backup ;;
+    restore)        cmd_restore "$@" ;;
+    prune-backups)  cmd_prune_backups "$@" ;;
+    export)         cmd_export "$@" ;;
+    import)         cmd_import "$@" ;;
+    checksum)       cmd_checksum ;;
+    validate)       cmd_validate ;;
+    acknowledge|ack) cmd_acknowledge ;;
     help|*)
         cat << 'USAGE'
 directive-ctl v2 — Manage the directive guardian registry
@@ -556,18 +756,24 @@ directive-ctl v2 — Manage the directive guardian registry
   Query:
     list [--category <tag>] [--priority <level>]
     search <keyword>
+    show <DIRECTIVE-XXX>      Print a single directive
     status
     validate
+    audit                     Validation + duplicates + integrity + backups
 
   Data:
-    backup                Create timestamped backup
-    restore [file]        Restore from backup
-    export [file]         Export as JSON
-    import <file>         Import from JSON export
-    checksum              Update SHA-256 integrity hash
+    backup                    Create timestamped backup
+    restore [file]            Restore from backup
+    prune-backups [keep=10]   Drop old timestamped backups
+    export [file]             Export as JSON
+    import <file> [mode]      mode: append (default) | skip (by title)
+    checksum                  Update SHA-256 integrity hash
+    acknowledge               Accept a tamper mismatch on next boot
 
   Priority: critical | high | medium | low
   ID format: DIRECTIVE-NNN (e.g., DIRECTIVE-001)
+
+  Env: $DIRECTIVE_MEMORY_DIR (preferred) or $CLAUDE_MEMORY_DIR or $OPENCLAW_MEMORY_DIR
 USAGE
         ;;
 esac

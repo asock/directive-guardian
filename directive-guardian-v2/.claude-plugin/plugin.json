@@ -1,0 +1,26 @@
+{
+  "name": "directive-guardian",
+  "version": "2.1.0",
+  "description": "Persistent-directive memory for Claude Code. Stores priority-ordered instructions in a canonical markdown registry and re-injects them on every SessionStart.",
+  "author": {
+    "name": "hellsy.net",
+    "url": "https://hellsy.net"
+  },
+  "homepage": "https://github.com/asock/directive-guardian",
+  "license": "MIT",
+  "keywords": ["memory", "directives", "persistence", "session-start", "hook"],
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-start.sh",
+            "timeout": 8000
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -9,8 +9,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 GUARDIAN="$SCRIPT_DIR/scripts/guardian.sh"
 CTL="$SCRIPT_DIR/scripts/directive-ctl.sh"
+SESSION_HOOK="$SCRIPT_DIR/hooks/session-start.sh"
 TEST_DIR=$(mktemp -d)
-export OPENCLAW_MEMORY_DIR="$TEST_DIR"
+# Tests use the new primary env var; legacy OPENCLAW_MEMORY_DIR still works
+# (there is a dedicated fallback test later).
+export DIRECTIVE_MEMORY_DIR="$TEST_DIR"
+unset OPENCLAW_MEMORY_DIR CLAUDE_MEMORY_DIR || true
 
 PASS=0
 FAIL=0
@@ -286,3 +290,176 @@ echo "── T17: --enabled value validation ──"
 
 assert_exit_code 1 "T17.1: Bogus --enabled value rejected" \
     "$CTL" edit DIRECTIVE-001 --enabled maybe
+
+# ── T18: show / get command ──────────────────────────────────────────
+echo ""
+echo "── T18: show command ──"
+
+output=$("$CTL" show DIRECTIVE-001 2>&1)
+assert_contains "$output" "[DIRECTIVE-001]" "T18.1: show prints target directive heading"
+assert_contains "$output" "Updated persona text" "T18.2: show prints directive body"
+assert_not_contains "$output" "DIRECTIVE-002" "T18.3: show does not leak neighbours"
+
+assert_exit_code 1 "T18.4: show on missing ID fails" "$CTL" show DIRECTIVE-999
+
+# ── T19: cmd_remove does not leak orphan content (AUDIT-03) ──────────
+echo ""
+echo "── T19: Remove keeps surrounding content intact ──"
+
+# Seed an orphan comment inside a directive block, then remove the
+# directive and assert neither the block NOR the orphan survive,
+# but the next directive does.
+"$CTL" add "RemoveSentinel" medium tooling "sentinel body" >/dev/null
+sentinel_id=$("$CTL" list 2>&1 | awk '/RemoveSentinel/ {match($0, /DIRECTIVE-[0-9]+/); print substr($0, RSTART, RLENGTH)}')
+# Inject an orphan line inside the sentinel's block by hand.
+awk -v t="$sentinel_id" '
+  /^## \[DIRECTIVE-[0-9]+\]/ { in_b = (index($0, "[" t "]") > 0) }
+  { print }
+  in_b && /^- \*\*directive\*\*:/ { print "this is an orphan line"; print ""; print "- stray note"; in_b = 0 }
+' "$TEST_DIR/directives.md" > "$TEST_DIR/directives.tmp" && mv "$TEST_DIR/directives.tmp" "$TEST_DIR/directives.md"
+"$CTL" add "RemoveNeighbour" low misc "still here" >/dev/null
+
+"$CTL" remove "$sentinel_id" >/dev/null
+content=$(cat "$TEST_DIR/directives.md")
+assert_not_contains "$content" "this is an orphan line" "T19.1: orphan line inside removed block is gone"
+assert_not_contains "$content" "RemoveSentinel" "T19.2: removed directive title is gone"
+assert_contains "$content" "RemoveNeighbour" "T19.3: neighbour directive survives"
+
+# ── T20: Duplicate-ID detection (AUDIT-02) ────────────────────────────
+echo ""
+echo "── T20: Duplicate ID detection ──"
+
+# Hand-duplicate DIRECTIVE-001 block by appending a second copy.
+{
+  echo ""
+  echo "## [DIRECTIVE-001] Duplicate Injected"
+  echo "- **priority**: low"
+  echo "- **category**: misc"
+  echo "- **enabled**: true"
+  echo "- **directive**: should be flagged"
+} >> "$TEST_DIR/directives.md"
+
+output=$("$CTL" validate 2>&1)
+assert_contains "$output" "duplicate ID [DIRECTIVE-001]" "T20.1: validate flags duplicates"
+
+output=$("$CTL" audit 2>&1)
+assert_contains "$output" "DIRECTIVE-001" "T20.2: audit surfaces duplicate"
+
+# Clean up duplicates so later tests pass
+tmpf=$(mktemp)
+awk 'BEGIN{seen=0} /^## \[DIRECTIVE-001\] Duplicate Injected/ {seen=1; next} seen && /^- \*\*/ {next} seen && /^$/ {seen=0; next} {print}' \
+    "$TEST_DIR/directives.md" > "$tmpf" && mv "$tmpf" "$TEST_DIR/directives.md"
+"$CTL" checksum >/dev/null
+
+# ── T21: Integrity does NOT self-heal (AUDIT-01) ──────────────────────
+echo ""
+echo "── T21: Integrity persists tamper across boots ──"
+
+"$GUARDIAN" >/dev/null 2>&1      # establish clean checksum
+echo "# tampered" >> "$TEST_DIR/directives.md"
+
+output=$("$GUARDIAN" 2>&1)
+assert_contains "$output" '"integrity": "modified_since_last_checksum"' "T21.1: first boot reports mismatch"
+
+# Second boot should STILL report mismatch — bug was that v2.0 silently
+# overwrote the stored hash after the first mismatch.
+output=$("$GUARDIAN" 2>&1)
+assert_contains "$output" '"integrity": "modified_since_last_checksum"' \
+    "T21.2: second boot also reports mismatch (no self-heal)"
+
+# Acknowledge, then next boot should be verified.
+"$CTL" acknowledge >/dev/null
+output=$("$GUARDIAN" 2>&1)
+assert_contains "$output" '"integrity": "modified_acknowledged"' "T21.3: acknowledged boot accepts new state"
+
+output=$("$GUARDIAN" 2>&1)
+assert_contains "$output" '"integrity": "verified"' "T21.4: subsequent boot is verified"
+
+# --verify-only mode
+assert_exit_code 0 "T21.5: --verify-only exits 0 on clean registry" "$GUARDIAN" --verify-only
+echo "# tamper again" >> "$TEST_DIR/directives.md"
+assert_exit_code 2 "T21.6: --verify-only exits 2 on mismatch" "$GUARDIAN" --verify-only
+"$CTL" acknowledge >/dev/null
+"$GUARDIAN" >/dev/null 2>&1      # refresh checksum
+
+# ── T22: Import with skip-by-title conflict mode ──────────────────────
+echo ""
+echo "── T22: Import conflict handling ──"
+
+if command -v jq >/dev/null 2>&1; then
+    "$CTL" export "$TEST_DIR/roundtrip.json" >/dev/null
+    before=$(awk '/^## \[DIRECTIVE-[0-9]+\]/ {n++} END {print n+0}' "$TEST_DIR/directives.md")
+    "$CTL" import "$TEST_DIR/roundtrip.json" skip >/dev/null
+    after=$(awk '/^## \[DIRECTIVE-[0-9]+\]/ {n++} END {print n+0}' "$TEST_DIR/directives.md")
+    if [ "$before" = "$after" ]; then
+        pass "T22.1: import in skip mode leaves count unchanged"
+    else
+        fail "T22.1: import in skip mode unchanged (before=$before after=$after)"
+    fi
+else
+    echo "  ⊘ T22: Skipped (jq not available)"
+fi
+
+# ── T23: Prune backups ────────────────────────────────────────────────
+echo ""
+echo "── T23: prune-backups ──"
+
+# Use distinct fake timestamps so prune has a deterministic set to work on.
+# Use an isolated subdir so we don't count backups accumulated by earlier tests.
+PRUNE_DIR=$(mktemp -d)
+(
+    export DIRECTIVE_MEMORY_DIR="$PRUNE_DIR"
+    "$GUARDIAN" >/dev/null 2>&1
+    for i in 1 2 3 4 5 6 7 8; do
+        touch "$PRUNE_DIR/directives.2020010${i}-000000.md.bak"
+    done
+    "$CTL" prune-backups 3 >"$PRUNE_DIR/prune.out" 2>&1
+)
+prune_output=$(cat "$PRUNE_DIR/prune.out")
+assert_contains "$prune_output" "kept 3 newest" "T23.1: prune reports keep count"
+remaining=$(find "$PRUNE_DIR" -maxdepth 1 -type f \
+            \( -name 'directives.*.md.bak' -o -name 'directives.*.bak' \) \
+            ! -name 'directives.md.bak' | wc -l | tr -d ' ')
+[ "$remaining" = "3" ] && pass "T23.2: only 3 timestamped backups remain" || fail "T23.2: expected 3, got $remaining"
+rm -rf "$PRUNE_DIR"
+
+# ── T24: SessionStart hook envelope ───────────────────────────────────
+echo ""
+echo "── T24: SessionStart hook ──"
+
+if [ -x "$SESSION_HOOK" ]; then
+    output=$(printf '{}' | "$SESSION_HOOK" 2>&1)
+    assert_contains "$output" '"hookEventName":"SessionStart"' "T24.1: hook emits SessionStart envelope"
+    assert_contains "$output" 'additionalContext' "T24.2: hook sets additionalContext"
+    if command -v jq >/dev/null 2>&1; then
+        if echo "$output" | jq . >/dev/null 2>&1; then
+            pass "T24.3: hook output is valid JSON"
+        else
+            fail "T24.3: hook output is NOT valid JSON"
+        fi
+    fi
+else
+    fail "T24: SessionStart hook missing or not executable at $SESSION_HOOK"
+fi
+
+# ── T25: Markdown output mode ─────────────────────────────────────────
+echo ""
+echo "── T25: guardian --format markdown ──"
+
+output=$("$GUARDIAN" --format markdown 2>&1)
+assert_contains "$output" "# Active Directives" "T25.1: markdown brief has header"
+assert_contains "$output" "DIRECTIVE-001" "T25.2: markdown brief lists a directive"
+
+# ── T26: Legacy env var fallback ──────────────────────────────────────
+echo ""
+echo "── T26: OPENCLAW_MEMORY_DIR legacy fallback ──"
+
+LEGACY_DIR=$(mktemp -d)
+(
+    unset DIRECTIVE_MEMORY_DIR CLAUDE_MEMORY_DIR
+    export OPENCLAW_MEMORY_DIR="$LEGACY_DIR"
+    "$GUARDIAN" >/dev/null 2>&1
+)
+[ -f "$LEGACY_DIR/directives.md" ] && pass "T26.1: legacy env var still creates registry" \
+    || fail "T26.1: legacy env var did not bootstrap"
+rm -rf "$LEGACY_DIR"

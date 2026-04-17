@@ -1,28 +1,61 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════
 # directive-guardian v2 — boot parser with integrity checking
-# Parses directives.md → priority-sorted JSON manifest
+# Parses directives.md → priority-sorted JSON manifest (or markdown brief)
 #
 # Fixes from v1 audit:
 #   BUG-001: Rewrote awk parser with proper flush-on-new-heading logic
 #   BUG-002: Full RFC 8259 JSON string escaping
 #   BUG-004: Replaced grep -oP with POSIX-compatible alternatives
 #   SEC-001: Advisory file locking via flock
-#   SEC-004: SHA-256 integrity verification
+#   SEC-004: SHA-256 integrity verification (no silent self-heal — see AUDIT-01)
 #   SEC-005: Auto-rotating log (max 500 lines)
+#
+# Flags:
+#   --format json|markdown   Output manifest as JSON (default) or markdown
+#   --verify-only            Skip checksum write + manifest; exit 2 on mismatch
+#
+# Memory dir resolution order:
+#   $DIRECTIVE_MEMORY_DIR  →  $CLAUDE_MEMORY_DIR  →  $OPENCLAW_MEMORY_DIR
+#   →  $HOME/.claude/directive-guardian  (new default)
 # ═══════════════════════════════════════════════════════════════════════
 
 set -euo pipefail
 
-MEMORY_DIR="${OPENCLAW_MEMORY_DIR:-$HOME/.openclaw/memory}"
+# Resolve memory dir with legacy fallbacks. A dir that already exists from a
+# previous install (openclaw or earlier claude path) wins, so upgrades are a no-op.
+resolve_memory_dir() {
+    if [ -n "${DIRECTIVE_MEMORY_DIR:-}" ]; then echo "$DIRECTIVE_MEMORY_DIR"; return; fi
+    if [ -n "${CLAUDE_MEMORY_DIR:-}"    ]; then echo "$CLAUDE_MEMORY_DIR";    return; fi
+    if [ -n "${OPENCLAW_MEMORY_DIR:-}"  ]; then echo "$OPENCLAW_MEMORY_DIR";  return; fi
+    if [ -d "$HOME/.openclaw/memory" ] && [ ! -d "$HOME/.claude/directive-guardian" ]; then
+        echo "$HOME/.openclaw/memory"; return
+    fi
+    echo "$HOME/.claude/directive-guardian"
+}
+
+MEMORY_DIR=$(resolve_memory_dir)
 REGISTRY="$MEMORY_DIR/directives.md"
 CHECKSUM_FILE="$MEMORY_DIR/directives.sha256"
+ACK_FILE="$MEMORY_DIR/.integrity-ack"
 LOGFILE="$MEMORY_DIR/directive-guardian.log"
 LOCKFILE="$MEMORY_DIR/.guardian.lock"
 # Captured once for the manifest output; log() refreshes per-line (S7).
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 MAX_LOG_LINES=500
 DRY_RUN="${GUARDIAN_DRY_RUN:-false}"
+
+FORMAT="json"
+VERIFY_ONLY="false"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --format)      FORMAT="${2:?--format requires json|markdown}"; shift 2 ;;
+        --verify-only) VERIFY_ONLY="true"; shift ;;
+        --help|-h)     echo "Usage: guardian.sh [--format json|markdown] [--verify-only]"; exit 0 ;;
+        *) echo "unknown flag: $1" >&2; exit 64 ;;
+    esac
+done
+case "$FORMAT" in json|markdown) ;; *) echo "invalid --format: $FORMAT" >&2; exit 64 ;; esac
 
 # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -109,9 +142,10 @@ fi
 # ── Integrity Check ───────────────────────────────────────────────────
 
 integrity="verified"
+stored_hash=""
+current_hash=""
 if [ -f "$CHECKSUM_FILE" ]; then
-    stored_hash=$(cat "$CHECKSUM_FILE" 2>/dev/null | awk '{print $1}')
-    # Portable: try sha256sum first (Linux), then shasum (macOS)
+    stored_hash=$(awk '{print $1}' "$CHECKSUM_FILE" 2>/dev/null || true)
     if command -v sha256sum >/dev/null 2>&1; then
         current_hash=$(sha256sum "$REGISTRY" | awk '{print $1}')
     elif command -v shasum >/dev/null 2>&1; then
@@ -122,12 +156,30 @@ if [ -f "$CHECKSUM_FILE" ]; then
     fi
 
     if [ "$current_hash" != "unavailable" ] && [ "$stored_hash" != "$current_hash" ]; then
-        integrity="modified_since_last_checksum"
-        log "INTEGRITY_WARNING — registry checksum mismatch (stored: ${stored_hash:0:12}… current: ${current_hash:0:12}…)"
+        # AUDIT-01: on mismatch, DO NOT silently overwrite the checksum below.
+        # Require an explicit acknowledgement file (touched by
+        # `directive-ctl acknowledge`) before we re-trust the new state.
+        if [ -f "$ACK_FILE" ]; then
+            integrity="modified_acknowledged"
+            log "INTEGRITY_ACK — mismatch accepted via $ACK_FILE (stored: ${stored_hash:0:12}… current: ${current_hash:0:12}…)"
+            rm -f "$ACK_FILE"
+        else
+            integrity="modified_since_last_checksum"
+            log "INTEGRITY_WARNING — registry checksum mismatch (stored: ${stored_hash:0:12}… current: ${current_hash:0:12}…)"
+        fi
     fi
 else
     integrity="no_checksum_file"
     log "INTEGRITY_INFO — no checksum file found, skipping verification"
+fi
+
+# --verify-only: report + exit without writing anything or emitting a manifest.
+if [ "$VERIFY_ONLY" = "true" ]; then
+    echo "integrity=$integrity"
+    case "$integrity" in
+        verified|no_checksum_file|modified_acknowledged) exit 0 ;;
+        *) exit 2 ;;
+    esac
 fi
 
 # ── Parse Directives ──────────────────────────────────────────────────
@@ -285,7 +337,32 @@ log "GUARDIAN BOOT COMPLETE — integrity=$integrity, $enabled_count/$total_coun
 # ── Output Manifest ───────────────────────────────────────────────────
 
 REGISTRY_ESC=$(json_escape_shell "$REGISTRY")
-cat << MANIFEST
+
+emit_markdown() {
+    # Human/LLM-readable brief used by the SessionStart hook. Enabled
+    # directives only, in priority order. Disabled ones are intentionally
+    # omitted — they should not re-enter context.
+    printf '# Active Directives (%s enabled / %s total)\n' "$enabled_count" "$total_count"
+    printf 'Source: `%s` — integrity: %s\n\n' "$REGISTRY" "$integrity"
+    if [ "$total_count" -eq 0 ]; then
+        printf '_No directives registered. Run `directive-ctl add` to create one._\n'
+        return
+    fi
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$sorted_output" | jq -r '
+            map(select(.enabled)) |
+            if length == 0 then "_All directives disabled._"
+            else .[] | "## [\(.id)] \(.title)\n- priority: \(.priority) · category: \(.category)\n- \(.directive)" + (if .verify != "" then "\n- verify: \(.verify)" else "" end) + "\n"
+            end'
+    else
+        printf '_jq unavailable; install jq for markdown rendering. Raw JSON follows:_\n\n```json\n%s\n```\n' "$sorted_output"
+    fi
+}
+
+if [ "$FORMAT" = "markdown" ]; then
+    emit_markdown
+else
+    cat << MANIFEST
 {
   "directives": $sorted_output,
   "count": $total_count,
@@ -297,12 +374,27 @@ cat << MANIFEST
   "registry": "$REGISTRY_ESC"
 }
 MANIFEST
+fi
 
 # ── Update Checksum ───────────────────────────────────────────────────
-if [ "$DRY_RUN" != "true" ]; then
+# AUDIT-01: only refresh the stored hash when the current state is trusted.
+# Unacknowledged mismatches keep the old checksum, so tampering persists
+# across runs until the user explicitly clears it via `directive-ctl acknowledge`.
+update_checksum_file() {
     if command -v sha256sum >/dev/null 2>&1; then
         sha256sum "$REGISTRY" > "$CHECKSUM_FILE"
     elif command -v shasum >/dev/null 2>&1; then
         shasum -a 256 "$REGISTRY" > "$CHECKSUM_FILE"
     fi
+}
+if [ "$DRY_RUN" != "true" ]; then
+    case "$integrity" in
+        verified|no_checksum_file|modified_acknowledged)
+            update_checksum_file
+            ;;
+        modified_since_last_checksum)
+            log "INTEGRITY_HOLD — refusing to overwrite checksum until ack"
+            ;;
+        *) ;;
+    esac
 fi
