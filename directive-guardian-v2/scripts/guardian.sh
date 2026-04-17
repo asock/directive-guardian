@@ -219,6 +219,7 @@ BEGIN {
     n = 0
     id = ""; title = ""; priority = ""; category = ""
     enabled = "true"; directive = ""; verify = ""
+    current_field = ""
     printf "["
 }
 
@@ -236,7 +237,7 @@ BEGIN {
 
     # Reset fields for new directive
     priority = ""; category = ""; enabled = "true"
-    directive = ""; verify = ""
+    directive = ""; verify = ""; current_field = ""
     next
 }
 
@@ -250,6 +251,7 @@ id != "" && /^- \*\*priority\*\*:/ {
     } else {
         priority = "medium"  # default if invalid
     }
+    current_field = "priority"
     next
 }
 
@@ -257,6 +259,7 @@ id != "" && /^- \*\*category\*\*:/ {
     val = $0; sub(/^- \*\*category\*\*: */, "", val)
     gsub(/^ +| +$/, "", val)
     category = val
+    current_field = "category"
     next
 }
 
@@ -264,20 +267,41 @@ id != "" && /^- \*\*enabled\*\*:/ {
     val = $0; sub(/^- \*\*enabled\*\*: */, "", val)
     gsub(/^ +| +$/, "", val)
     enabled = (val == "false") ? "false" : "true"
+    current_field = "enabled"
     next
 }
 
 id != "" && /^- \*\*directive\*\*:/ {
     val = $0; sub(/^- \*\*directive\*\*: */, "", val)
-    gsub(/^ +| +$/, "", val)
+    sub(/[ \t]+$/, "", val)
     directive = val
+    current_field = "directive"
     next
 }
 
 id != "" && /^- \*\*verify\*\*:/ {
     val = $0; sub(/^- \*\*verify\*\*: */, "", val)
-    gsub(/^ +| +$/, "", val)
+    sub(/[ \t]+$/, "", val)
     verify = val
+    current_field = "verify"
+    next
+}
+
+# Continuation line: leading whitespace inside a directive block extends the
+# most recent multi-line-capable field (directive/verify). Matches GitHub-
+# rendered markdown list-item continuations. Single-value fields
+# (priority/category/enabled) ignore continuations.
+id != "" && current_field != "" && /^[ \t]+[^ \t]/ {
+    val = $0; sub(/^[ \t]+/, "", val); sub(/[ \t]+$/, "", val)
+    if (current_field == "directive") directive = directive "\n" val
+    else if (current_field == "verify") verify = verify "\n" val
+    next
+}
+
+# Any non-continuation, non-field, non-heading line inside a block terminates
+# the current field so stray content does not silently fold into verify.
+id != "" && !/^[ \t]/ && !/^## \[DIRECTIVE-/ && !/^- \*\*/ {
+    current_field = ""
     next
 }
 
@@ -349,10 +373,13 @@ emit_markdown() {
         return
     fi
     if command -v jq >/dev/null 2>&1; then
+        # Multiline directive/verify bodies use `\n` — re-indent continuation
+        # lines so the result is well-formed markdown (list-item continuation).
         printf '%s' "$sorted_output" | jq -r '
+            def reindent: gsub("\n"; "\n  ");
             map(select(.enabled)) |
             if length == 0 then "_All directives disabled._"
-            else .[] | "## [\(.id)] \(.title)\n- priority: \(.priority) · category: \(.category)\n- \(.directive)" + (if .verify != "" then "\n- verify: \(.verify)" else "" end) + "\n"
+            else .[] | "## [\(.id)] \(.title)\n- priority: \(.priority) · category: \(.category)\n- \(.directive | reindent)" + (if .verify != "" then "\n- verify: \(.verify | reindent)" else "" end) + "\n"
             end'
     else
         printf '_jq unavailable; install jq for markdown rendering. Raw JSON follows:_\n\n```json\n%s\n```\n' "$sorted_output"

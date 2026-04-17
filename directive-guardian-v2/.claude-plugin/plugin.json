@@ -9,6 +9,7 @@
   "homepage": "https://github.com/asock/directive-guardian",
   "license": "MIT",
   "keywords": ["memory", "directives", "persistence", "session-start", "hook"],
+  "commands": "./commands/",
   "hooks": {
     "SessionStart": [
       {

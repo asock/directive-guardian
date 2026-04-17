@@ -250,31 +250,38 @@ cmd_edit() {
             *) die "Unknown flag: $1 (use --directive, --priority, --category, --verify, --enabled)" ;;
         esac
 
-        # Use awk to find the target block and replace the specific field
+        # Replace the target block field. On a match we also swallow any
+        # indented continuation lines belonging to the OLD value so we do not
+        # leave orphaned content attached to the replacement.
         awk -v target="$target" -v field="$field" -v value="$value" '
-        BEGIN { in_block = 0; found_field = 0 }
+        BEGIN { in_block = 0; found_field = 0; swallow = 0 }
         /^## \[DIRECTIVE-[0-9]+\]/ {
-            # Flush missing field if we were in target block and didnt find it
             if (in_block && !found_field) {
                 print "- **" field "**: " value
             }
             in_block = (index($0, "[" target "]") > 0) ? 1 : 0
             found_field = 0
+            swallow = 0
             print
             next
         }
         in_block && $0 ~ "^- \\*\\*" field "\\*\\*:" {
             print "- **" field "**: " value
             found_field = 1
+            swallow = 1
             next
         }
+        # Any other field marker ends continuation-swallowing.
+        in_block && /^- \*\*/ { swallow = 0; print; next }
+        # Continuation lines of the replaced field — drop them.
+        in_block && swallow && /^[ \t]+[^ \t]/ { next }
+        in_block && swallow && /^$/ { swallow = 0; print; next }
+        { print }
         END {
-            # If last block was target and field wasnt found, append
             if (in_block && !found_field) {
                 print "- **" field "**: " value
             }
         }
-        { print }
         ' "$REGISTRY" > "$REGISTRY.tmp"
 
         mv "$REGISTRY.tmp" "$REGISTRY"
@@ -626,6 +633,102 @@ cmd_show() {
     ' "$REGISTRY"
 }
 
+cmd_from_claude_md() {
+    # Onboarding (AUDIT UX-001): seed the registry from an existing CLAUDE.md.
+    # Each top-level (##) section becomes a `high`/`identity` directive whose
+    # body is the section contents (multiline). Sub-sections and bullets are
+    # preserved via continuation lines.
+    local infile="${1:-}"
+    if [ -z "$infile" ]; then
+        for cand in "./CLAUDE.md" "$HOME/.claude/CLAUDE.md" "$HOME/CLAUDE.md"; do
+            [ -f "$cand" ] && infile="$cand" && break
+        done
+    fi
+    [ -n "$infile" ] && [ -f "$infile" ] || die "No CLAUDE.md found — pass a path explicitly"
+
+    ensure_registry
+    acquire_lock
+    backup_registry
+
+    local next_num
+    next_num=$(grep -oE 'DIRECTIVE-[0-9]+' "$REGISTRY" 2>/dev/null | \
+               grep -oE '[0-9]+' | sort -n | tail -1)
+    next_num=${next_num:-0}
+
+    # Build a plan file of (title, body) pairs via awk, then append each as a
+    # directive. Only ## headings split sections — # headings start the doc
+    # and are treated as the file title (skipped as a directive).
+    local plan
+    plan=$(mktemp)
+    awk '
+    function emit(title, body) {
+        if (title == "" && body == "") return
+        # Trim trailing blank lines from body
+        sub(/\n+$/, "", body)
+        printf "§§§TITLE§§§%s\n§§§BODY§§§\n%s\n§§§END§§§\n", title, body
+    }
+    BEGIN { title = ""; body = "" }
+    /^# / { next }  # top-level doc title, skip
+    /^## / {
+        emit(title, body)
+        title = $0; sub(/^## */, "", title)
+        body = ""
+        next
+    }
+    { body = body $0 "\n" }
+    END { emit(title, body) }
+    ' "$infile" > "$plan"
+
+    local imported=0 title body in_body=0
+    title=""; body=""
+    while IFS= read -r line; do
+        case "$line" in
+            "§§§TITLE§§§"*)
+                title="${line#§§§TITLE§§§}"; body=""; in_body=0 ;;
+            "§§§BODY§§§") in_body=1 ;;
+            "§§§END§§§")
+                in_body=0
+                [ -n "$title" ] && [ -n "$body" ] || continue
+                next_num=$((next_num + 1))
+                local nid
+                nid=$(printf "%03d" "$next_num")
+                # Shorten title to <=60 chars for the heading
+                local short_title="${title:0:60}"
+                # Write the directive with body as continuation lines (2-space indent)
+                {
+                    echo ""
+                    echo "## [DIRECTIVE-${nid}] ${short_title}"
+                    echo "- **priority**: high"
+                    echo "- **category**: imported"
+                    echo "- **enabled**: true"
+                    local first=1
+                    while IFS= read -r bline; do
+                        if [ "$first" = "1" ]; then
+                            echo "- **directive**: ${bline}"
+                            first=0
+                        else
+                            echo "  ${bline}"
+                        fi
+                    done <<<"$body"
+                } >> "$REGISTRY"
+                imported=$((imported + 1))
+                title=""; body=""
+                ;;
+            *)
+                if [ "$in_body" = "1" ]; then
+                    if [ -z "$body" ]; then body="$line"; else body="$body"$'\n'"$line"; fi
+                fi
+                ;;
+        esac
+    done < "$plan"
+    rm -f "$plan"
+
+    update_checksum
+    rotate_log
+    log "FROM_CLAUDE_MD — imported $imported directives from $infile"
+    echo "✓ Imported $imported directives from $infile"
+}
+
 cmd_acknowledge() {
     # AUDIT-01: user-explicit consent to re-trust the registry after tamper.
     # Next guardian.sh run will clear the flag and refresh the checksum.
@@ -739,6 +842,7 @@ case "$cmd" in
     prune-backups)  cmd_prune_backups "$@" ;;
     export)         cmd_export "$@" ;;
     import)         cmd_import "$@" ;;
+    from-claude-md) cmd_from_claude_md "$@" ;;
     checksum)       cmd_checksum ;;
     validate)       cmd_validate ;;
     acknowledge|ack) cmd_acknowledge ;;
@@ -767,6 +871,7 @@ directive-ctl v2 — Manage the directive guardian registry
     prune-backups [keep=10]   Drop old timestamped backups
     export [file]             Export as JSON
     import <file> [mode]      mode: append (default) | skip (by title)
+    from-claude-md [file]     Seed registry from an existing CLAUDE.md
     checksum                  Update SHA-256 integrity hash
     acknowledge               Accept a tamper mismatch on next boot
 

@@ -463,3 +463,146 @@ LEGACY_DIR=$(mktemp -d)
 [ -f "$LEGACY_DIR/directives.md" ] && pass "T26.1: legacy env var still creates registry" \
     || fail "T26.1: legacy env var did not bootstrap"
 rm -rf "$LEGACY_DIR"
+
+# ── T27: Multiline directive parsing ──────────────────────────────────
+echo ""
+echo "── T27: Multiline directive continuation lines ──"
+
+# Hand-edit a multiline directive into the registry.
+cat >> "$TEST_DIR/directives.md" << 'MULTI'
+
+## [DIRECTIVE-099] Multiline Test
+- **priority**: high
+- **category**: testing
+- **enabled**: true
+- **directive**: First line of the directive.
+  Second line extends it.
+  Third line too.
+- **verify**: verify line one.
+  verify line two.
+MULTI
+
+"$CTL" checksum >/dev/null
+output=$("$GUARDIAN" 2>&1)
+assert_valid_json "$output" "T27.1: multiline JSON is well-formed"
+assert_contains "$output" "Second line extends it." "T27.2: second line captured in manifest"
+assert_contains "$output" "Third line too." "T27.3: third line captured"
+assert_contains "$output" "verify line two." "T27.4: verify field continuation captured"
+
+# Check that the JSON-encoded directive contains escaped newlines.
+if command -v jq >/dev/null 2>&1; then
+    dir_text=$(echo "$output" | jq -r '.directives[] | select(.id=="DIRECTIVE-099") | .directive')
+    if echo "$dir_text" | grep -q "Second line extends it."; then
+        pass "T27.5: jq reads multiline directive body"
+    else
+        fail "T27.5: jq could not read multiline body"
+    fi
+fi
+
+# Markdown brief should have 2-space indented continuations (valid markdown list item).
+md_output=$("$GUARDIAN" --format markdown 2>&1)
+if echo "$md_output" | grep -qE "^  Second line extends it\."; then
+    pass "T27.6: markdown brief indents continuation lines"
+else
+    fail "T27.6: markdown brief does not indent continuations"
+    echo "$md_output" | grep -A2 "DIRECTIVE-099" | sed 's/^/    /' >&2
+fi
+
+# ── T28: Edit preserves no orphan continuation lines ─────────────────
+echo ""
+echo "── T28: Edit strips old multiline continuations ──"
+
+"$CTL" edit DIRECTIVE-099 --directive "single line replacement" >/dev/null
+content=$(cat "$TEST_DIR/directives.md")
+assert_not_contains "$content" "Second line extends it." "T28.1: old continuation line 1 removed"
+assert_not_contains "$content" "Third line too." "T28.2: old continuation line 2 removed"
+assert_contains "$content" "single line replacement" "T28.3: new value written"
+# The verify field's continuations should still be intact — we only edited directive.
+assert_contains "$content" "verify line two." "T28.4: neighbouring field continuations preserved"
+"$CTL" remove DIRECTIVE-099 >/dev/null
+
+# ── T29: from-claude-md onboarding ────────────────────────────────────
+echo ""
+echo "── T29: from-claude-md import ──"
+
+CLAUDE_SRC=$(mktemp)
+cat > "$CLAUDE_SRC" << 'CLAUDE_EOF'
+# Project Context
+
+## Persona
+Be direct and precise.
+Avoid corporate fluff.
+
+## Tool preferences
+Prefer ripgrep.
+Use Docker for isolation.
+
+## Project awareness
+The network is hellsy.net. Projects include VOIDROID, catio.cam.
+CLAUDE_EOF
+
+before=$(awk '/^## \[DIRECTIVE-[0-9]+\]/ {n++} END {print n+0}' "$TEST_DIR/directives.md")
+"$CTL" from-claude-md "$CLAUDE_SRC" >/dev/null
+after=$(awk '/^## \[DIRECTIVE-[0-9]+\]/ {n++} END {print n+0}' "$TEST_DIR/directives.md")
+delta=$((after - before))
+[ "$delta" = "3" ] && pass "T29.1: imported 3 directives from CLAUDE.md" \
+    || fail "T29.1: expected 3 imports, got $delta"
+
+assert_contains "$(cat "$TEST_DIR/directives.md")" "Persona" "T29.2: section title preserved"
+assert_contains "$(cat "$TEST_DIR/directives.md")" "Use Docker for isolation." "T29.3: section body preserved"
+assert_contains "$(cat "$TEST_DIR/directives.md")" "**category**: imported" "T29.4: imported category set"
+
+# Round-trip: the guardian should parse the imported directives as multiline.
+output=$("$GUARDIAN" 2>&1)
+assert_valid_json "$output" "T29.5: registry still parses as valid JSON"
+assert_contains "$output" "Avoid corporate fluff." "T29.6: multiline body survives round-trip"
+
+rm -f "$CLAUDE_SRC"
+
+# ── T30: Install script ───────────────────────────────────────────────
+echo ""
+echo "── T30: install.sh ──"
+
+INSTALLER="$SCRIPT_DIR/install.sh"
+if [ -x "$INSTALLER" ]; then
+    INSTALL_TEST=$(mktemp -d)
+    INSTALL_HOME=$(mktemp -d)
+    (
+        unset DIRECTIVE_MEMORY_DIR CLAUDE_MEMORY_DIR OPENCLAW_MEMORY_DIR
+        export HOME="$INSTALL_HOME"
+        export CLAUDE_PLUGINS_DIR="$INSTALL_TEST"
+        "$INSTALLER" >/dev/null 2>&1
+    )
+    [ -f "$INSTALL_TEST/directive-guardian/scripts/guardian.sh" ] \
+        && pass "T30.1: install.sh copies scripts to dest" \
+        || fail "T30.1: install.sh did not copy scripts"
+    [ -f "$INSTALL_TEST/directive-guardian/.claude-plugin/plugin.json" ] \
+        && pass "T30.2: install.sh copies plugin manifest" \
+        || fail "T30.2: install.sh did not copy plugin manifest"
+    [ -x "$INSTALL_TEST/directive-guardian/hooks/session-start.sh" ] \
+        && pass "T30.3: hook is executable after install" \
+        || fail "T30.3: hook not executable after install"
+    [ -d "$INSTALL_TEST/directive-guardian/commands" ] \
+        && pass "T30.4: install.sh copies commands dir" \
+        || fail "T30.4: install.sh did not copy commands"
+    # Re-running the installer should replace cleanly, not error.
+    (
+        unset DIRECTIVE_MEMORY_DIR CLAUDE_MEMORY_DIR OPENCLAW_MEMORY_DIR
+        export HOME="$INSTALL_HOME"
+        export CLAUDE_PLUGINS_DIR="$INSTALL_TEST"
+        "$INSTALLER" >/dev/null 2>&1
+    ) && pass "T30.5: install.sh re-run succeeds" \
+        || fail "T30.5: install.sh re-run failed"
+    rm -rf "$INSTALL_TEST" "$INSTALL_HOME"
+else
+    echo "  ⊘ T30: install.sh not executable, skipping"
+fi
+
+# ── T31: Slash command files present ─────────────────────────────────
+echo ""
+echo "── T31: Slash commands present ──"
+
+for cmd in directives directive-add directive-audit directive-reapply directive-ack; do
+    f="$SCRIPT_DIR/commands/$cmd.md"
+    [ -f "$f" ] && pass "T31.$cmd: $cmd.md exists" || fail "T31.$cmd: $cmd.md missing"
+done
