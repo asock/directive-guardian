@@ -2,6 +2,38 @@
 
 All notable changes to directive-guardian.
 
+## [2.2.0] — 2026-04-17
+
+### Added
+- **Git mode**: `directive-ctl git-init` turns the memory dir into a git
+  repo; setting `GUARDIAN_GIT_AUTOCOMMIT=true` makes every mutation
+  (add / edit / remove / import / from-claude-md) produce a commit.
+  Uses a dedicated tool identity (`directive-guardian@localhost`) and
+  bypasses signing because these are automated tool snapshots, not
+  user-authored commits.
+- **Schema version sentinel** — new registries include
+  `<!-- directive-guardian schema: 1 -->` as line 1. Guardian logs
+  `SCHEMA_WARNING` on mismatch; legacy registries without the sentinel
+  still load.
+- **Five more slash commands**: `/directive-show`, `/directive-remove`,
+  `/directive-toggle`, `/directive-search`, `/directive-export`.
+
+### Fixed
+- **`next_id` octal bug** — `$(( 008 + 1 ))` crashed with
+  "value too great for base" whenever the last directive was
+  `DIRECTIVE-008` or `DIRECTIVE-009`, silently dropping writes under
+  concurrency. Fixed by forcing base-10 with `10#` prefix in `next_id`,
+  `cmd_import`, and `cmd_from_claude_md`.
+- **`cmd_edit` / `cmd_import` subshell propagation** — `set -e` inherited
+  into git helper subshells aborted on missing optional files. Pinned
+  with explicit `set +e` and trailing `exit 0` inside the subshells.
+
+### Tests
+- 101 → 118 green. New coverage: schema sentinel presence/mismatch,
+  git auto-commit for add/edit/remove, autocommit gated by env var,
+  `git-init` idempotence, and a 10-way concurrent-write stress test
+  (which is how the `next_id` octal bug was caught).
+
 ## [2.1.0] — 2026-04-17
 
 The "actually a Claude Code plugin" release. Adds the SessionStart

@@ -111,8 +111,10 @@ fi
 touch "$LOGFILE"
 rotate_log
 
+SCHEMA_VERSION=1
 if [ ! -f "$REGISTRY" ]; then
-    cat > "$REGISTRY" << 'TMPL'
+    cat > "$REGISTRY" << TMPL
+<!-- directive-guardian schema: $SCHEMA_VERSION -->
 # Directive Registry
 # Managed by directive-guardian v2
 # Each ## heading is one directive. See SKILL.md for format docs.
@@ -121,9 +123,16 @@ if [ ! -f "$REGISTRY" ]; then
 # Fields: priority, category, enabled, directive, verify
 # See SKILL.md for full documentation
 TMPL
-    log "BOOTSTRAP — created empty registry at $REGISTRY"
+    log "BOOTSTRAP — created empty registry at $REGISTRY (schema=$SCHEMA_VERSION)"
     emit_empty_manifest "bootstrapped"
     exit 0
+fi
+
+# Schema-version check: read the first sentinel line if present and warn on
+# mismatch. Missing sentinel is tolerated (legacy registries from v2.0/2.1.0).
+file_schema=$(head -1 "$REGISTRY" | sed -n 's/.*schema: *\([0-9][0-9]*\).*/\1/p')
+if [ -n "$file_schema" ] && [ "$file_schema" != "$SCHEMA_VERSION" ]; then
+    log "SCHEMA_WARNING — registry schema=$file_schema, guardian expects $SCHEMA_VERSION"
 fi
 
 # ── File Locking ──────────────────────────────────────────────────────

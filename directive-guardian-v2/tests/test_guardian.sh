@@ -602,7 +602,141 @@ fi
 echo ""
 echo "── T31: Slash commands present ──"
 
-for cmd in directives directive-add directive-audit directive-reapply directive-ack; do
+for cmd in directives directive-add directive-audit directive-reapply directive-ack \
+           directive-show directive-remove directive-toggle directive-search directive-export; do
     f="$SCRIPT_DIR/commands/$cmd.md"
     [ -f "$f" ] && pass "T31.$cmd: $cmd.md exists" || fail "T31.$cmd: $cmd.md missing"
 done
+
+# ── T32: Schema version header ────────────────────────────────────────
+echo ""
+echo "── T32: Schema version header ──"
+
+SCHEMA_DIR=$(mktemp -d)
+(
+    export DIRECTIVE_MEMORY_DIR="$SCHEMA_DIR"
+    "$GUARDIAN" >/dev/null 2>&1
+)
+if head -1 "$SCHEMA_DIR/directives.md" | grep -qF 'directive-guardian schema: 1'; then
+    pass "T32.1: bootstrap writes schema sentinel"
+else
+    fail "T32.1: schema sentinel missing from bootstrap"
+fi
+
+# Mismatched schema triggers a log warning but still parses.
+sed -i.bak 's/schema: 1/schema: 9/' "$SCHEMA_DIR/directives.md" 2>/dev/null || \
+    (awk 'NR==1 {sub(/schema: 1/, "schema: 9")} {print}' "$SCHEMA_DIR/directives.md" > "$SCHEMA_DIR/directives.md.tmp" && \
+     mv "$SCHEMA_DIR/directives.md.tmp" "$SCHEMA_DIR/directives.md")
+
+# Seed a directive so the guardian gets past bootstrap.
+(
+    export DIRECTIVE_MEMORY_DIR="$SCHEMA_DIR"
+    "$CTL" add "Test" high misc "body" >/dev/null 2>&1
+    "$CTL" acknowledge >/dev/null 2>&1
+    "$GUARDIAN" >/dev/null 2>&1
+)
+if grep -qF "SCHEMA_WARNING" "$SCHEMA_DIR/directive-guardian.log"; then
+    pass "T32.2: mismatched schema logs SCHEMA_WARNING"
+else
+    fail "T32.2: no SCHEMA_WARNING logged on mismatch"
+fi
+rm -rf "$SCHEMA_DIR"
+
+# ── T33: Git auto-commit mode ─────────────────────────────────────────
+echo ""
+echo "── T33: Git auto-commit ──"
+
+if command -v git >/dev/null 2>&1; then
+    GIT_DIR=$(mktemp -d)
+    (
+        export DIRECTIVE_MEMORY_DIR="$GIT_DIR"
+        "$GUARDIAN" >/dev/null 2>&1
+        "$CTL" git-init >/dev/null 2>&1
+    )
+    [ -d "$GIT_DIR/.git" ] && pass "T33.1: git-init creates a repo" \
+        || fail "T33.1: git-init did not create a repo"
+
+    initial_commits=$(cd "$GIT_DIR" && git rev-list --count HEAD 2>/dev/null || echo 0)
+    (
+        export DIRECTIVE_MEMORY_DIR="$GIT_DIR"
+        export GUARDIAN_GIT_AUTOCOMMIT=true
+        "$CTL" add "GitPersona" critical identity "Be direct." >/dev/null 2>&1
+        "$CTL" edit DIRECTIVE-001 --priority high >/dev/null 2>&1
+        "$CTL" remove DIRECTIVE-001 >/dev/null 2>&1
+    )
+    final_commits=$(cd "$GIT_DIR" && git rev-list --count HEAD 2>/dev/null || echo 0)
+    delta=$((final_commits - initial_commits))
+    if [ "$delta" -ge 3 ]; then
+        pass "T33.2: auto-commit created $delta commits for add+edit+remove"
+    else
+        fail "T33.2: expected ≥3 auto-commits, got $delta"
+    fi
+
+    # With autocommit OFF, no new commits should appear.
+    pre=$(cd "$GIT_DIR" && git rev-list --count HEAD 2>/dev/null || echo 0)
+    (
+        export DIRECTIVE_MEMORY_DIR="$GIT_DIR"
+        unset GUARDIAN_GIT_AUTOCOMMIT
+        "$CTL" add "NoCommit" low misc "should not commit" >/dev/null 2>&1
+    )
+    post=$(cd "$GIT_DIR" && git rev-list --count HEAD 2>/dev/null || echo 0)
+    [ "$pre" = "$post" ] && pass "T33.3: no commits when autocommit unset" \
+        || fail "T33.3: unexpected commits with autocommit off (pre=$pre post=$post)"
+
+    # Re-running git-init on an existing repo is idempotent.
+    output=$( (export DIRECTIVE_MEMORY_DIR="$GIT_DIR"; "$CTL" git-init 2>&1) )
+    assert_contains "$output" "already a git repo" "T33.4: git-init is idempotent"
+    rm -rf "$GIT_DIR"
+else
+    echo "  ⊘ T33: git not installed, skipping"
+fi
+
+# ── T34: Concurrent writes respect the lock ───────────────────────────
+echo ""
+echo "── T34: Concurrent adds ──"
+
+if command -v flock >/dev/null 2>&1; then
+    CONC_DIR=$(mktemp -d)
+    (
+        set +e
+        export DIRECTIVE_MEMORY_DIR="$CONC_DIR"
+        "$GUARDIAN" >/dev/null 2>&1
+
+        # Fire 10 parallel `add` processes.
+        pids=()
+        for i in $(seq 1 10); do
+            (
+                export DIRECTIVE_MEMORY_DIR="$CONC_DIR"
+                "$CTL" add "Racer$i" medium race "body $i" >/dev/null 2>&1
+            ) &
+            pids+=($!)
+        done
+        for p in "${pids[@]}"; do wait "$p" 2>/dev/null || true; done
+    ) || true
+
+    count=$(awk '/^## \[DIRECTIVE-[0-9]+\]/ {n++} END {print n+0}' "$CONC_DIR/directives.md")
+    if [ "$count" = "10" ]; then
+        pass "T34.1: 10 concurrent adds all landed"
+    else
+        fail "T34.1: expected 10 directives after race, got $count"
+    fi
+
+    # All IDs should be unique (no collisions).
+    dupes=$(grep -oE 'DIRECTIVE-[0-9]+' "$CONC_DIR/directives.md" | sort | uniq -d | wc -l | tr -d ' ')
+    [ "$dupes" = "0" ] && pass "T34.2: no duplicate IDs after concurrent adds" \
+        || fail "T34.2: $dupes duplicate IDs after race"
+
+    # Registry must still parse as valid JSON.
+    output=$(DIRECTIVE_MEMORY_DIR="$CONC_DIR" "$GUARDIAN" 2>&1)
+    assert_valid_json "$output" "T34.3: registry still parses after race"
+    assert_contains "$output" '"count": 10' "T34.4: manifest reports 10 directives"
+
+    # Validate still passes (no duplicate-ID detection triggered).
+    output=$(DIRECTIVE_MEMORY_DIR="$CONC_DIR" "$CTL" validate 2>&1)
+    assert_contains "$output" "All directives valid" "T34.5: validate passes after race"
+    assert_not_contains "$output" "duplicate ID" "T34.6: no duplicate-ID flags after race"
+
+    rm -rf "$CONC_DIR"
+else
+    echo "  ⊘ T34: flock not installed, skipping"
+fi

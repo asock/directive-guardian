@@ -77,6 +77,33 @@ acquire_lock() {
     fi
 }
 
+# Git auto-commit helper. Called by mutating commands after the checksum is
+# refreshed. Gated on $GUARDIAN_GIT_AUTOCOMMIT=true AND the memory dir being a
+# working git tree. Failures are non-fatal — never block a mutation.
+git_autocommit() {
+    [ "${GUARDIAN_GIT_AUTOCOMMIT:-false}" = "true" ] || return 0
+    command -v git >/dev/null 2>&1 || return 0
+    [ -d "$MEMORY_DIR/.git" ] || return 0
+    local op="${1:-update}" detail="${2:-}"
+    (
+        set +e
+        cd "$MEMORY_DIR" || exit 0
+        for f in directives.md directives.sha256; do
+            [ -f "$f" ] && git add -- "$f" 2>/dev/null
+        done
+        # Nothing staged → nothing to commit (covers noop edits etc.)
+        git diff --cached --quiet 2>/dev/null && exit 0
+        local msg="$op"
+        [ -n "$detail" ] && msg="$op — $detail"
+        git -c user.email=directive-guardian@localhost \
+            -c user.name="directive-guardian" \
+            -c commit.gpgsign=false \
+            commit -q -m "$msg" 2>/dev/null
+        exit 0
+    ) >/dev/null 2>&1
+    log "GIT_AUTOCOMMIT — $op $detail"
+}
+
 # Backup before destructive ops (SEC-002, FEAT-002).
 # Writes both a rolling .bak (latest, easy to find) AND a timestamped copy
 # so two destructive ops in a row don't destroy the only recoverable state (S2).
@@ -120,13 +147,14 @@ validate_id() {
         die "Invalid ID format '$1' — expected DIRECTIVE-NNN"
 }
 
-# Find next available ID number (POSIX-safe, no grep -P)
+# Find next available ID number (POSIX-safe, no grep -P).
+# Use bash 10#N notation to force base-10 — otherwise DIRECTIVE-008 / -009
+# crash the arithmetic with "value too great for base" (octal parse).
 next_id() {
     local last
-    # Only match actual heading lines, not comments or examples
     last=$(grep -E '^## \[DIRECTIVE-[0-9]+\]' "$REGISTRY" 2>/dev/null | \
            grep -oE 'DIRECTIVE-[0-9]+' | grep -oE '[0-9]+' | sort -n | tail -1)
-    printf "%03d" $(( ${last:-0} + 1 ))
+    printf "%03d" $(( 10#${last:-0} + 1 ))
 }
 
 # Check if an ID exists in the registry
@@ -170,6 +198,7 @@ cmd_add() {
     update_checksum
     rotate_log
     log "ADDED [DIRECTIVE-${nid}] \"${title}\" (priority=$priority, category=$category)"
+    git_autocommit "add" "DIRECTIVE-${nid} ${title}"
     echo "✓ Added DIRECTIVE-${nid}: ${title}"
 }
 
@@ -220,6 +249,7 @@ cmd_remove() {
     update_checksum
     rotate_log
     log "REMOVED [$target]"
+    git_autocommit "remove" "$target"
     echo "✓ Removed $target (backup at $REGISTRY.bak)"
 }
 
@@ -290,6 +320,7 @@ cmd_edit() {
         echo "✓ Updated $target: $field = $value"
     done
     rotate_log
+    git_autocommit "edit" "$target"
 }
 
 cmd_enable() {
@@ -502,9 +533,12 @@ cmd_import() {
     case "$conflict_mode" in append|skip|replace) ;; *) die "Unknown conflict mode: $conflict_mode (use append|skip|replace)" ;; esac
 
     local next_num
+    # Strip any leading zeros before arithmetic so 008/009 do not trigger
+    # bash octal parsing (see next_id fix). sed works; bash `10#` also works
+    # at the call site, but stripping here keeps the increment simple.
     next_num=$(grep -oE 'DIRECTIVE-[0-9]+' "$REGISTRY" 2>/dev/null | \
                grep -oE '[0-9]+' | sort -n | tail -1)
-    next_num=${next_num:-0}
+    next_num=$((10#${next_num:-0}))
 
     local existing_titles=""
     existing_titles=$(awk '
@@ -553,6 +587,7 @@ cmd_import() {
     update_checksum
     rotate_log
     log "IMPORTED — $imported directives from $infile (mode=$conflict_mode, skipped=$skipped)"
+    git_autocommit "import" "$imported from $(basename "$infile")"
     echo "✓ Imported $imported directives from $infile (skipped $skipped duplicates)"
 }
 
@@ -653,7 +688,7 @@ cmd_from_claude_md() {
     local next_num
     next_num=$(grep -oE 'DIRECTIVE-[0-9]+' "$REGISTRY" 2>/dev/null | \
                grep -oE '[0-9]+' | sort -n | tail -1)
-    next_num=${next_num:-0}
+    next_num=$((10#${next_num:-0}))
 
     # Build a plan file of (title, body) pairs via awk, then append each as a
     # directive. Only ## headings split sections — # headings start the doc
@@ -726,7 +761,47 @@ cmd_from_claude_md() {
     update_checksum
     rotate_log
     log "FROM_CLAUDE_MD — imported $imported directives from $infile"
+    git_autocommit "from-claude-md" "$imported directives from $(basename "$infile")"
     echo "✓ Imported $imported directives from $infile"
+}
+
+cmd_git_init() {
+    # Turn the memory dir into a git repo so every mutation (when
+    # GUARDIAN_GIT_AUTOCOMMIT=true) is recorded as a commit. Safe to re-run.
+    command -v git >/dev/null 2>&1 || die "git is not installed"
+    ensure_registry
+    if [ -d "$MEMORY_DIR/.git" ]; then
+        echo "✓ $MEMORY_DIR is already a git repo"
+    else
+        # Disable set -e inside so a missing optional file or a failed
+        # config-less commit doesn't abort before we finish bootstrapping.
+        (
+            set +e
+            cd "$MEMORY_DIR" || exit 0
+            git init -q -b main 2>/dev/null || git init -q
+            cat > .gitignore << 'GITIGNORE'
+.guardian.lock
+.integrity-ack
+directive-guardian.log
+directives.md.bak
+directives.*.md.bak
+directives.pre-restore.bak
+GITIGNORE
+            for f in .gitignore directives.md directives.sha256; do
+                [ -f "$f" ] && git add "$f" 2>/dev/null
+            done
+            # Bypass GPG signing for tool-identity commits — these are the
+            # bot's snapshots, not the user's authored changes.
+            git -c user.email=directive-guardian@localhost \
+                -c user.name="directive-guardian" \
+                -c commit.gpgsign=false \
+                commit -q -m "Initial registry" 2>/dev/null
+            exit 0
+        )
+        echo "✓ Initialised $MEMORY_DIR as git repo"
+    fi
+    echo "  Enable auto-commit on mutations:"
+    echo "    export GUARDIAN_GIT_AUTOCOMMIT=true"
 }
 
 cmd_acknowledge() {
@@ -843,6 +918,7 @@ case "$cmd" in
     export)         cmd_export "$@" ;;
     import)         cmd_import "$@" ;;
     from-claude-md) cmd_from_claude_md "$@" ;;
+    git-init)       cmd_git_init ;;
     checksum)       cmd_checksum ;;
     validate)       cmd_validate ;;
     acknowledge|ack) cmd_acknowledge ;;
@@ -872,6 +948,7 @@ directive-ctl v2 — Manage the directive guardian registry
     export [file]             Export as JSON
     import <file> [mode]      mode: append (default) | skip (by title)
     from-claude-md [file]     Seed registry from an existing CLAUDE.md
+    git-init                  Turn memory dir into a git repo (auto-commit)
     checksum                  Update SHA-256 integrity hash
     acknowledge               Accept a tamper mismatch on next boot
 
@@ -879,6 +956,7 @@ directive-ctl v2 — Manage the directive guardian registry
   ID format: DIRECTIVE-NNN (e.g., DIRECTIVE-001)
 
   Env: $DIRECTIVE_MEMORY_DIR (preferred) or $CLAUDE_MEMORY_DIR or $OPENCLAW_MEMORY_DIR
+       $GUARDIAN_GIT_AUTOCOMMIT=true → auto-commit mutations after `git-init`
 USAGE
         ;;
 esac
