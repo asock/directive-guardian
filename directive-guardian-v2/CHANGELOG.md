@@ -2,6 +2,28 @@
 
 All notable changes to directive-guardian.
 
+## [2.3.0] — 2026-04-17
+
+### Added
+- **Auto-prune** — backups trimmed to `MAX_BACKUPS` (default 10) after every
+  mutation. Gated on `GUARDIAN_AUTO_PRUNE=true` (default). The memory dir no
+  longer grows unbounded on busy installs.
+- **`directive-ctl sync [both|push|pull]`** — git-backed multi-device sync.
+  Snapshots any un-committed local edits first (so manual CLAUDE.md tweaks
+  aren't stranded), rebases on pull, pushes on push. No-ops cleanly when
+  no `origin` remote is configured.
+- **`directive-ctl list --json`** — machine-readable output. Reuses the
+  guardian's JSON manifest as the source of truth; `--category` and
+  `--priority` filters apply via jq.
+- **Markdown brief grouped by category** — the hook-injected context now
+  reads as `### <category> (count)` sections rather than a flat list.
+  Categories containing a critical directive sort first, then by name.
+
+### Tests
+- 118 → 130 green. New coverage: auto-prune cap, `list --json` shape and
+  filters, categorical grouping and ordering in the markdown brief, and
+  the sync push path against a local bare remote.
+
 ## [2.2.0] — 2026-04-17
 
 ### Added

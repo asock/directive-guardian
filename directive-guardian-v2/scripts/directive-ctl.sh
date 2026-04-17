@@ -197,6 +197,7 @@ cmd_add() {
 
     update_checksum
     rotate_log
+    auto_prune
     log "ADDED [DIRECTIVE-${nid}] \"${title}\" (priority=$priority, category=$category)"
     git_autocommit "add" "DIRECTIVE-${nid} ${title}"
     echo "✓ Added DIRECTIVE-${nid}: ${title}"
@@ -248,6 +249,7 @@ cmd_remove() {
     mv "$REGISTRY.tmp" "$REGISTRY"
     update_checksum
     rotate_log
+    auto_prune
     log "REMOVED [$target]"
     git_autocommit "remove" "$target"
     echo "✓ Removed $target (backup at $REGISTRY.bak)"
@@ -320,6 +322,7 @@ cmd_edit() {
         echo "✓ Updated $target: $field = $value"
     done
     rotate_log
+    auto_prune
     git_autocommit "edit" "$target"
 }
 
@@ -335,15 +338,30 @@ cmd_disable() {
 
 cmd_list() {
     ensure_registry
-    local filter_cat="" filter_pri=""
+    local filter_cat="" filter_pri="" json_mode=false
 
     while [ $# -gt 0 ]; do
         case "$1" in
             --category) filter_cat="${2:?Missing category}"; shift 2 ;;
             --priority) filter_pri="${2:?Missing priority}"; shift 2; validate_priority "$filter_pri" ;;
+            --json)     json_mode=true; shift ;;
             *) shift ;;
         esac
     done
+
+    # --json reuses the guardian's JSON manifest and applies the same filters
+    # via jq so the two paths never drift (single source of truth).
+    if [ "$json_mode" = "true" ]; then
+        command -v jq >/dev/null 2>&1 || die "--json requires jq"
+        local script_dir manifest
+        script_dir="$(cd "$(dirname "$0")" && pwd)"
+        manifest=$(GUARDIAN_DRY_RUN=true "$script_dir/guardian.sh" 2>/dev/null)
+        local jq_filter='.directives'
+        [ -n "$filter_cat" ] && jq_filter="$jq_filter | map(select(.category == \$cat))"
+        [ -n "$filter_pri" ] && jq_filter="$jq_filter | map(select(.priority == \$pri))"
+        echo "$manifest" | jq --arg cat "$filter_cat" --arg pri "$filter_pri" "$jq_filter"
+        return 0
+    fi
 
     echo "═══ Directive Registry ═══"
 
@@ -586,6 +604,7 @@ cmd_import() {
 
     update_checksum
     rotate_log
+    auto_prune
     log "IMPORTED — $imported directives from $infile (mode=$conflict_mode, skipped=$skipped)"
     git_autocommit "import" "$imported from $(basename "$infile")"
     echo "✓ Imported $imported directives from $infile (skipped $skipped duplicates)"
@@ -760,9 +779,67 @@ cmd_from_claude_md() {
 
     update_checksum
     rotate_log
+    auto_prune
     log "FROM_CLAUDE_MD — imported $imported directives from $infile"
     git_autocommit "from-claude-md" "$imported directives from $(basename "$infile")"
     echo "✓ Imported $imported directives from $infile"
+}
+
+cmd_sync() {
+    # Git-backed multi-device sync. Runs pull --rebase first so local mutations
+    # land on top of remote ones (avoids merge commits in the tool timeline),
+    # then pushes. No-op when the memory dir is not a git repo or has no
+    # configured remote — sync is always advisory, never required.
+    command -v git >/dev/null 2>&1 || die "git is not installed"
+    ensure_registry
+    [ -d "$MEMORY_DIR/.git" ] || die "$MEMORY_DIR is not a git repo — run 'directive-ctl git-init' first"
+
+    local mode="${1:-both}"   # both | push | pull
+    case "$mode" in push|pull|both) ;; *) die "sync mode must be push|pull|both" ;; esac
+
+    # Any uncommitted state gets a snapshot commit before we sync so
+    # user-applied manual edits aren't stranded.
+    (
+        set +e
+        cd "$MEMORY_DIR" || exit 0
+        if ! git diff --quiet -- directives.md 2>/dev/null; then
+            git add -- directives.md 2>/dev/null
+            [ -f directives.sha256 ] && git add -- directives.sha256 2>/dev/null
+            git -c user.email=directive-guardian@localhost \
+                -c user.name="directive-guardian" \
+                -c commit.gpgsign=false \
+                commit -q -m "sync — snapshot local mutations" 2>/dev/null
+        fi
+        exit 0
+    )
+
+    local remote_url=""
+    remote_url=$(cd "$MEMORY_DIR" && git remote get-url origin 2>/dev/null || true)
+    if [ -z "$remote_url" ]; then
+        echo "✗ No 'origin' remote configured — add one with:"
+        echo "    (cd $MEMORY_DIR && git remote add origin <url>)"
+        return 1
+    fi
+
+    local failed=0
+    if [ "$mode" = "pull" ] || [ "$mode" = "both" ]; then
+        if ( cd "$MEMORY_DIR" && git pull --rebase --autostash -q origin HEAD 2>&1 ); then
+            echo "✓ pulled from $remote_url"
+        else
+            echo "✗ pull failed (see output above)"
+            failed=1
+        fi
+    fi
+    if [ "$mode" = "push" ] || [ "$mode" = "both" ]; then
+        if ( cd "$MEMORY_DIR" && git push -q origin HEAD 2>&1 ); then
+            echo "✓ pushed to $remote_url"
+        else
+            echo "✗ push failed (see output above)"
+            failed=1
+        fi
+    fi
+    log "SYNC — mode=$mode remote=$remote_url failed=$failed"
+    return $failed
 }
 
 cmd_git_init() {
@@ -814,32 +891,52 @@ cmd_acknowledge() {
     echo "✓ Integrity acknowledgement queued — next guardian.sh run will accept current state"
 }
 
+# Shared backup-pruning worker. Returns the number of files deleted via stdout
+# so the caller can decide whether to log/report. Excludes the rolling
+# directives.md.bak from both the set AND the retention count.
+_prune_backups_worker() {
+    local keep="$1"
+    local -a backups=()
+    while IFS= read -r -d '' f; do
+        backups+=("$f")
+    done < <(find "$MEMORY_DIR" -maxdepth 1 -type f \
+             -name 'directives.*.md.bak' ! -name 'directives.md.bak' \
+             -print0 2>/dev/null | sort -z)
+
+    local total=${#backups[@]} drop=0 i=0
+    if [ "$total" -gt "$keep" ]; then
+        drop=$((total - keep))
+        while [ "$i" -lt "$drop" ]; do
+            rm -f -- "${backups[$i]}"
+            i=$((i + 1))
+        done
+    fi
+    echo "$drop"
+}
+
 cmd_prune_backups() {
     ensure_registry
     local keep="${1:-$MAX_BACKUPS}"
     case "$keep" in ''|*[!0-9]*) die "prune-backups: keep count must be a non-negative integer" ;; esac
 
-    # List timestamped backups oldest-first so we can drop the head.
-    local -a backups=()
-    while IFS= read -r -d '' f; do
-        backups+=("$f")
-    done < <(find "$MEMORY_DIR" -maxdepth 1 -type f \
-             \( -name 'directives.*.md.bak' -o -name 'directives.*.bak' \) \
-             -print0 2>/dev/null | sort -z)
-
-    local total=${#backups[@]}
-    if [ "$total" -le "$keep" ]; then
-        echo "✓ $total backup(s) present — nothing to prune (keep=$keep)"
-        return 0
+    local drop
+    drop=$(_prune_backups_worker "$keep")
+    if [ "$drop" -gt 0 ]; then
+        log "PRUNE_BACKUPS — removed $drop backup(s), kept $keep"
+        echo "✓ Pruned $drop old backup(s), kept $keep newest"
+    else
+        echo "✓ Nothing to prune (keep=$keep)"
     fi
-    local drop=$((total - keep))
-    local i=0
-    while [ "$i" -lt "$drop" ]; do
-        rm -f -- "${backups[$i]}"
-        i=$((i + 1))
-    done
-    log "PRUNE_BACKUPS — removed $drop backup(s), kept $keep"
-    echo "✓ Pruned $drop old backup(s), kept $keep newest"
+}
+
+# Called by mutating commands after update_checksum. Silent unless it actually
+# deletes something, and never fatal. Skipped when $GUARDIAN_AUTO_PRUNE=false.
+auto_prune() {
+    [ "${GUARDIAN_AUTO_PRUNE:-true}" = "false" ] && return 0
+    local drop
+    drop=$(_prune_backups_worker "$MAX_BACKUPS" 2>/dev/null || echo 0)
+    [ "$drop" -gt 0 ] && log "AUTO_PRUNE — trimmed $drop backup(s), kept $MAX_BACKUPS"
+    return 0
 }
 
 cmd_audit() {
@@ -919,6 +1016,7 @@ case "$cmd" in
     import)         cmd_import "$@" ;;
     from-claude-md) cmd_from_claude_md "$@" ;;
     git-init)       cmd_git_init ;;
+    sync)           cmd_sync "$@" ;;
     checksum)       cmd_checksum ;;
     validate)       cmd_validate ;;
     acknowledge|ack) cmd_acknowledge ;;
@@ -934,7 +1032,7 @@ directive-ctl v2 — Manage the directive guardian registry
     disable <DIRECTIVE-XXX>
 
   Query:
-    list [--category <tag>] [--priority <level>]
+    list [--category <tag>] [--priority <level>] [--json]
     search <keyword>
     show <DIRECTIVE-XXX>      Print a single directive
     status
@@ -949,6 +1047,7 @@ directive-ctl v2 — Manage the directive guardian registry
     import <file> [mode]      mode: append (default) | skip (by title)
     from-claude-md [file]     Seed registry from an existing CLAUDE.md
     git-init                  Turn memory dir into a git repo (auto-commit)
+    sync [both|push|pull]     Push/pull the git-backed registry (requires origin)
     checksum                  Update SHA-256 integrity hash
     acknowledge               Accept a tamper mismatch on next boot
 

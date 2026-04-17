@@ -691,6 +691,132 @@ else
     echo "  ⊘ T33: git not installed, skipping"
 fi
 
+# ── T34.5: Auto-prune keeps backup count capped ──────────────────────
+echo ""
+echo "── T34.5: Auto-prune ──"
+
+PRUNE_AUTO_DIR=$(mktemp -d)
+(
+    export DIRECTIVE_MEMORY_DIR="$PRUNE_AUTO_DIR"
+    export GUARDIAN_AUTO_PRUNE=true
+    "$GUARDIAN" >/dev/null 2>&1
+    # Seed 25 adds so we definitely exceed MAX_BACKUPS=10.
+    for i in $(seq 1 25); do
+        "$CTL" add "Auto$i" low race "body $i" >/dev/null 2>&1
+    done
+)
+autoremaining=$(find "$PRUNE_AUTO_DIR" -maxdepth 1 -type f \
+                -name 'directives.*.md.bak' ! -name 'directives.md.bak' | wc -l | tr -d ' ')
+if [ "$autoremaining" -le 10 ]; then
+    pass "T34.5.1: auto-prune kept backup count ≤ 10 (got $autoremaining)"
+else
+    fail "T34.5.1: auto-prune failed — $autoremaining backups retained"
+fi
+rm -rf "$PRUNE_AUTO_DIR"
+
+# ── T35: list --json ──────────────────────────────────────────────────
+echo ""
+echo "── T35: list --json ──"
+
+if command -v jq >/dev/null 2>&1; then
+    JSON_DIR=$(mktemp -d)
+    (
+        export DIRECTIVE_MEMORY_DIR="$JSON_DIR"
+        "$GUARDIAN" >/dev/null 2>&1
+        "$CTL" add "Critical" critical identity "cA" >/dev/null 2>&1
+        "$CTL" add "High" high tooling "cB" >/dev/null 2>&1
+        "$CTL" add "Medium" medium tooling "cC" >/dev/null 2>&1
+    )
+    output=$(DIRECTIVE_MEMORY_DIR="$JSON_DIR" "$CTL" list --json 2>&1)
+    if echo "$output" | jq . >/dev/null 2>&1; then
+        pass "T35.1: --json output is valid JSON"
+    else
+        fail "T35.1: --json output is not valid JSON"
+    fi
+    count=$(echo "$output" | jq 'length')
+    [ "$count" = "3" ] && pass "T35.2: --json returns all 3 directives" \
+        || fail "T35.2: expected 3, got $count"
+
+    output=$(DIRECTIVE_MEMORY_DIR="$JSON_DIR" "$CTL" list --json --priority critical 2>&1)
+    count=$(echo "$output" | jq 'length')
+    [ "$count" = "1" ] && pass "T35.3: --json + --priority filters correctly" \
+        || fail "T35.3: expected 1, got $count"
+
+    output=$(DIRECTIVE_MEMORY_DIR="$JSON_DIR" "$CTL" list --json --category tooling 2>&1)
+    count=$(echo "$output" | jq 'length')
+    [ "$count" = "2" ] && pass "T35.4: --json + --category filters correctly" \
+        || fail "T35.4: expected 2, got $count"
+
+    rm -rf "$JSON_DIR"
+else
+    echo "  ⊘ T35: jq not available, skipping"
+fi
+
+# ── T36: Markdown brief groups by category ────────────────────────────
+echo ""
+echo "── T36: Markdown brief category grouping ──"
+
+if command -v jq >/dev/null 2>&1; then
+    GRP_DIR=$(mktemp -d)
+    (
+        export DIRECTIVE_MEMORY_DIR="$GRP_DIR"
+        "$GUARDIAN" >/dev/null 2>&1
+        "$CTL" add "P" critical identity "persona" >/dev/null 2>&1
+        "$CTL" add "T1" high tooling "tool1"   >/dev/null 2>&1
+        "$CTL" add "T2" medium tooling "tool2" >/dev/null 2>&1
+        "$CTL" add "S"  low style   "style"    >/dev/null 2>&1
+    )
+    output=$(DIRECTIVE_MEMORY_DIR="$GRP_DIR" "$GUARDIAN" --format markdown 2>&1)
+
+    assert_contains "$output" "### identity (1)" "T36.1: identity category header"
+    assert_contains "$output" "### tooling (2)" "T36.2: tooling category shows count 2"
+    assert_contains "$output" "### style (1)" "T36.3: style category header"
+
+    # The critical-bearing category should come BEFORE the low-only one.
+    idx_id=$(echo "$output" | awk '/### identity/ {print NR; exit}')
+    idx_style=$(echo "$output" | awk '/### style/ {print NR; exit}')
+    if [ "$idx_id" -lt "$idx_style" ]; then
+        pass "T36.4: critical-bearing category sorts before low-only category"
+    else
+        fail "T36.4: identity=$idx_id, style=$idx_style (expected identity first)"
+    fi
+    rm -rf "$GRP_DIR"
+else
+    echo "  ⊘ T36: jq not available, skipping"
+fi
+
+# ── T37: Sync command (no remote) ─────────────────────────────────────
+echo ""
+echo "── T37: sync without remote ──"
+
+if command -v git >/dev/null 2>&1; then
+    SYNC_DIR=$(mktemp -d)
+    (
+        export DIRECTIVE_MEMORY_DIR="$SYNC_DIR"
+        "$GUARDIAN" >/dev/null 2>&1
+        "$CTL" git-init >/dev/null 2>&1
+    )
+    # No remote → should exit non-zero with a helpful message.
+    output=$(DIRECTIVE_MEMORY_DIR="$SYNC_DIR" "$CTL" sync 2>&1 || true)
+    assert_contains "$output" "No 'origin' remote" "T37.1: sync without remote reports missing origin"
+
+    # Configure a local bare repo as remote, then sync should push successfully.
+    REMOTE_DIR=$(mktemp -d)
+    (cd "$REMOTE_DIR" && git init -q --bare)
+    (cd "$SYNC_DIR" && git remote add origin "$REMOTE_DIR")
+    output=$(DIRECTIVE_MEMORY_DIR="$SYNC_DIR" "$CTL" sync push 2>&1 || true)
+    assert_contains "$output" "pushed to" "T37.2: sync push succeeds to local bare remote"
+
+    # Verify the remote has commits now.
+    remote_commits=$(cd "$REMOTE_DIR" && git rev-list --count --all 2>/dev/null || echo 0)
+    [ "$remote_commits" -gt 0 ] && pass "T37.3: remote received commits" \
+        || fail "T37.3: remote has no commits after push"
+
+    rm -rf "$SYNC_DIR" "$REMOTE_DIR"
+else
+    echo "  ⊘ T37: git not available, skipping"
+fi
+
 # ── T34: Concurrent writes respect the lock ───────────────────────────
 echo ""
 echo "── T34: Concurrent adds ──"

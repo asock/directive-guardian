@@ -382,13 +382,29 @@ emit_markdown() {
         return
     fi
     if command -v jq >/dev/null 2>&1; then
-        # Multiline directive/verify bodies use `\n` — re-indent continuation
-        # lines so the result is well-formed markdown (list-item continuation).
+        # Group by category for readability. Within each category, directives
+        # stay in the priority order the caller already sorted into. Multiline
+        # directive/verify bodies are re-indented so every continuation line is
+        # a valid markdown list-item continuation (2-space prefix).
         printf '%s' "$sorted_output" | jq -r '
             def reindent: gsub("\n"; "\n  ");
-            map(select(.enabled)) |
-            if length == 0 then "_All directives disabled._"
-            else .[] | "## [\(.id)] \(.title)\n- priority: \(.priority) · category: \(.category)\n- \(.directive | reindent)" + (if .verify != "" then "\n- verify: \(.verify | reindent)" else "" end) + "\n"
+            map(select(.enabled)) as $active |
+            if ($active | length) == 0 then "_All directives disabled._"
+            else
+                ($active | group_by(.category) | sort_by(
+                    # Categories containing critical directives rank first,
+                    # so the most important block anchors the top.
+                    [
+                      (map(.priority) | map(if . == "critical" then 0 elif . == "high" then 1 elif . == "medium" then 2 else 3 end) | min),
+                      (.[0].category)
+                    ]
+                )) as $groups |
+                ($groups | map(
+                    "### \(.[0].category) (\(length))\n" +
+                    (map("- **[\(.id)] \(.title)** · `\(.priority)`\n  \(.directive | reindent)" +
+                         (if .verify != "" then "\n  _verify:_ \(.verify | reindent)" else "" end)
+                    ) | join("\n\n")) + "\n"
+                ) | join("\n"))
             end'
     else
         printf '_jq unavailable; install jq for markdown rendering. Raw JSON follows:_\n\n```json\n%s\n```\n' "$sorted_output"

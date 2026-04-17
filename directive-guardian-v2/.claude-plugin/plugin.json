@@ -1,6 +1,6 @@
 {
   "name": "directive-guardian",
-  "version": "2.2.0",
+  "version": "2.3.0",
   "description": "Persistent-directive memory for Claude Code. Stores priority-ordered instructions in a canonical markdown registry and re-injects them on every SessionStart.",
   "author": {
     "name": "hellsy.net",
